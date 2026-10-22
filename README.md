@@ -1,7 +1,7 @@
 # NexoVirt Host Agent
 
 The node agent of [NexoVirt](https://nexovirt.com), the self-hosted control panel for Proxmox VE.
-One standalone PHP file (`nexovirt-agent.php`, version **0.24.1**) that runs as root on a Proxmox VE node,
+One standalone PHP file (`nexovirt-agent.php`, version **0.27.0**) that runs as root on a Proxmox VE node,
 sends a heartbeat to your NexoVirt panel and runs a fixed, allowlisted set of jobs the panel queues for it.
 
 - Website: [nexovirt.com](https://nexovirt.com)
@@ -63,6 +63,13 @@ opening a public issue.
 | `apt_simulate` | `{names:[...]}` (1-500 names matching `^[a-z0-9][a-z0-9+.-]{0,127}$`, escapeshellarg'd): `apt-get -s install --only-upgrade <names>`, returns what would really be upgraded/installed. A selection that would remove packages is refused with the list |
 | `apt_upgrade_start` | `{mode: all\|selected, names}`: `dist-upgrade` or `install --only-upgrade <names>` with `DEBIAN_FRONTEND=noninteractive` and `--force-confdef --force-confold`, started DETACHED via `systemd-run --unit=nexovirt-apt-upgrade --collect` (output in `/var/log/nexovirt/apt-upgrade.log`, 0600; exit code in `apt-upgrade.exit`). Refuses while the unit is active or dpkg is locked; returns at once with a run id. Never reboots |
 | `apt_upgrade_status` | `{offset}`: `running`/`succeeded`/`failed`/`idle` + exit code, the log after the byte offset (64 KiB per call) and `reboot_required` (newer kernel installed than running, or `/var/run/reboot-required`) |
+| `nat_inventory` | (0.24.5) Read-only: the node's NAT rules (iptables-save nat/raw/filter, `nft -a list ruleset`), the NAT lines of `/etc/network/interfaces(.d)`, `/etc/iptables/rules.v4`, `/etc/nftables.conf` + includes, units and interface hooks that set NAT, optional TCP probes (max 32). Used to adopt hand-made NAT |
+| `nat_adopt_finalize` | (0.24.5) After an adoption was verified: removes exactly the adopted rules (iptables `-C` then `-D` from the original tokens, nft by handle after re-reading the rule), comments out their source lines with a never-overwritten backup, disables ticked units. Only rules in the adoption scope (nat DNAT/SNAT/MASQUERADE, raw PREROUTING CT, filter FORWARD ACCEPT); refuses unless every NexoVirt replacement rule is live |
+| `nat_adopt_restore` | (0.24.5) Undoes a finalize: restores backed-up files only while they still have the switch-off checksum, re-adds absent rules and chains, re-enables units |
+| `apply_dhcp` | (0.25.0) Full desired set of DHCP pools on NAT bridges: one `dnsmasq` per bridge (`nexovirt-dhcp@<bridge>`, `port=0`, bind-interfaces), MAC reservations from the guest configs. Refuses a bridge with a foreign DHCP server |
+| `apply_fail2ban` / `read_fail2ban` / `fail2ban_unban` | (0.25.1) Web UI login jail: writes only `/etc/fail2ban/{jail,filter}.d/nexovirt-pve.conf` (pvedaemon journal, port 8006), tests the config first, installs fail2ban only when missing, reports existing jails watching 8006, unbans only in its own jail |
+| `lxc_app_install` / `lxc_app_status` | (0.25.0) One-click apps: runs a signed catalog install script inside a container (`pct exec`, settings as environment variables, script SHA-256 checked) detached, and reports its status and log tail |
+| `backup_hooks_apply` | (0.27.0) Disks per backup job: writes one vzdump hook per backup job to `/var/lib/nexovirt/backup-hooks/<job>.sh` (+ `.json`). The hook sets each listed disk's `backup` flag at job-start (compare-and-set under the Proxmox config lock) and puts the old value back after that guest and at job end; a disk changed meanwhile is left alone, leftovers are restored hourly when no backup runs. Job ids, disk keys (`scsi/sata/ide/virtio N`, `mpN`) and VMIDs are validated |
 
 Unknown job types are rejected. A job whose handler throws reports a generic error (details go to the
 journal) instead of killing the agent. Results that could not be delivered are re-sent with the next

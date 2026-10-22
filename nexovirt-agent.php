@@ -7,7 +7,9 @@
  *  clear_nat, read_firewall, read_system, read_pve, read_logs, read_pve_logs,
  *  probe_sdn_dhcp, ensure_sdn_dhcp, ensure_sdn_egress, set_ip_forward,
  *  lxc_root_ssh, lxc_set_password, scan_ips, dyndns_configure, apply_wireguard, read_wireguard,
- *  apt_refresh, apt_simulate, apt_upgrade_start, apt_upgrade_status)
+ *  apt_refresh, apt_simulate, apt_upgrade_start, apt_upgrade_status, nat_inventory,
+ *  nat_adopt_finalize, nat_adopt_restore, apply_dhcp, apply_fail2ban, read_fail2ban, fail2ban_unban,
+ *  lxc_app_install, lxc_app_status)
  *
  * A standalone PHP 8.0+ CLI script. No CodeIgniter dependency.
  * Install on a Proxmox VE host and point it at your NexoVirt panel.
@@ -27,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.24.1';
+const AGENT_VERSION        = '0.27.0';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -1380,6 +1382,7 @@ const NAT_SCRIPT_PATH  = '/usr/local/sbin/nexovirt-nat.sh';
 const NAT_UNIT_PATH    = '/etc/systemd/system/nexovirt-nat.service';
 const NAT_SYSCTL_PATH  = '/etc/sysctl.d/99-nexovirt-nat.conf';
 const NAT_MODULES_PATH = '/etc/modules-load.d/nexovirt-nat.conf';
+const NAT_MAX_NETWORKS = 32;
 
 /** A Linux network interface name: 1..15 chars, letters/digits/dot/underscore/hyphen. */
 function nexovirt_validate_iface(string $i): bool
@@ -1422,7 +1425,7 @@ function nexovirt_validate_probe_host(string $h): bool
  *
  * @return array{ok:bool,result:string}
  */
-function nexovirt_probe_tcp(string $host, $port): array
+function nexovirt_probe_tcp(string $host, $port, float $timeout = 5.0): array
 {
     if (! nexovirt_validate_probe_host($host) || ! nexovirt_validate_port($port)) {
         return ['ok' => false, 'result' => 'invalid probe_tcp payload'];
@@ -1430,7 +1433,7 @@ function nexovirt_probe_tcp(string $host, $port): array
     $target = filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false ? '[' . $host . ']' : $host;
     $errno  = 0;
     $errstr = '';
-    $fh     = @fsockopen($target, (int) $port, $errno, $errstr, 5.0);
+    $fh     = @fsockopen($target, (int) $port, $errno, $errstr, $timeout);
     if ($fh === false) {
         return ['ok' => true, 'result' => nexovirt_json(['reachable' => false, 'error' => $errstr !== '' ? $errstr : ('connect failed (' . $errno . ')')])];
     }
@@ -1559,6 +1562,21 @@ function nexovirt_validate_nat_config(array $config): array
     // panel passes those subnets in allowed_dest_cidrs. Re-validate each here (fail-closed): only
     // RFC1918 ranges are accepted, so a bad/compromised panel can't DNAT to an arbitrary public IP.
     $destCidrs = [$cidr];
+    // Several NAT networks (0.24.3, adopted NAT): each one RFC1918, its own WAN iface, optional SNAT address.
+    $networks = $config['networks'] ?? [];
+    if (! is_array($networks) || count($networks) > NAT_MAX_NETWORKS) {
+        return ['ok' => false, 'error' => 'invalid networks'];
+    }
+    foreach ($networks as $n) {
+        if (! is_array($n) || ! nexovirt_validate_nat_cidr((string) ($n['cidr'] ?? '')) || ! nexovirt_validate_iface((string) ($n['wan_iface'] ?? ''))) {
+            return ['ok' => false, 'error' => 'invalid network'];
+        }
+        $snat = (string) ($n['snat_ip'] ?? '');
+        if ($snat !== '' && filter_var($snat, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+            return ['ok' => false, 'error' => 'invalid network snat_ip'];
+        }
+        $destCidrs[] = (string) $n['cidr'];
+    }
     $allowed   = $config['allowed_dest_cidrs'] ?? [];
     if (is_array($allowed)) {
         foreach ($allowed as $a) {
@@ -1581,6 +1599,10 @@ function nexovirt_validate_nat_config(array $config): array
 
         if (! nexovirt_validate_proto($proto)) {
             return ['ok' => false, 'error' => 'invalid proto'];
+        }
+        $pip = (string) ($f['public_ip'] ?? '');
+        if ($pip !== '' && filter_var($pip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+            return ['ok' => false, 'error' => 'invalid public_ip'];
         }
         if (! nexovirt_validate_port($pub)) {
             return ['ok' => false, 'error' => 'invalid port'];
@@ -1697,11 +1719,22 @@ function nexovirt_build_nat_script(array $config): string
     // 4. Return traffic for anything we forward / masquerade (hosts with FORWARD policy DROP).
     $lines[] = 'iptables -A NEXOVIRT-FWD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT';
 
-    // 5. MASQUERADE the private network out the WAN bridge (never traffic that stays inside it),
-    //    and let it be forwarded out.
-    if (! empty($config['masquerade'])) {
-        $lines[] = "iptables -t nat -A NEXOVIRT-POST -s {$cidr} ! -d {$cidr} -o {$wan} -j MASQUERADE";
-        $lines[] = "iptables -A NEXOVIRT-FWD -s {$cidr} -o {$wan} -j ACCEPT";
+    // 5. MASQUERADE (or SNAT to one address) each private network out its WAN bridge (never traffic
+    //    that stays inside it), and let it be forwarded out. `networks` (0.24.3) lists every NAT
+    //    network; without it the single private_cidr is the only one.
+    $networks = isset($config['networks']) && is_array($config['networks']) && $config['networks'] !== []
+        ? $config['networks']
+        : [['cidr' => (string) $config['private_cidr'], 'wan_iface' => (string) $config['wan_iface'], 'masquerade' => ! empty($config['masquerade']), 'snat_ip' => '']];
+    foreach ($networks as $n) {
+        if (empty($n['masquerade'])) {
+            continue;
+        }
+        $nc   = escapeshellarg((string) $n['cidr']);
+        $nw   = escapeshellarg((string) $n['wan_iface']);
+        $snat = (string) ($n['snat_ip'] ?? '');
+        $to   = $snat !== '' ? 'SNAT --to-source ' . escapeshellarg($snat) : 'MASQUERADE';
+        $lines[] = "iptables -t nat -A NEXOVIRT-POST -s {$nc} ! -d {$nc} -o {$nw} -j {$to}";
+        $lines[] = "iptables -A NEXOVIRT-FWD -s {$nc} -o {$nw} -j ACCEPT";
     }
 
     // 6. Per-forward DNAT + matching FORWARD ACCEPT.
@@ -1711,23 +1744,1070 @@ function nexovirt_build_nat_script(array $config): string
         $dipA  = escapeshellarg($dip);
         $start = (int) $f['public_port'];
         $end   = ($f['public_port_end'] ?? null) !== null ? (int) $f['public_port_end'] : null;
+        // Only one public address of the WAN (the adopted rule had `-d <public ip>`).
+        $pipA  = (string) ($f['public_ip'] ?? '') !== '' ? ' -d ' . escapeshellarg((string) $f['public_ip']) : '';
 
         if ($end !== null) {
             // Range: same-port DNAT (no remap), range FORWARD ACCEPT.
             $rangeA = escapeshellarg($start . ':' . $end);
-            $lines[] = "iptables -t nat -A NEXOVIRT-PRE -i {$wan} -p {$proto} --dport {$rangeA} -j DNAT --to-destination {$dipA}";
+            $lines[] = "iptables -t nat -A NEXOVIRT-PRE -i {$wan}{$pipA} -p {$proto} --dport {$rangeA} -j DNAT --to-destination {$dipA}";
             $lines[] = "iptables -A NEXOVIRT-FWD -d {$dipA} -p {$proto} --dport {$rangeA} -j ACCEPT";
         } else {
             $pub    = escapeshellarg((string) $start);
             $dport  = (string) (int) $f['dest_port'];
             $dest   = escapeshellarg($dip . ':' . $dport);
             $dportA = escapeshellarg($dport);
-            $lines[] = "iptables -t nat -A NEXOVIRT-PRE -i {$wan} -p {$proto} --dport {$pub} -j DNAT --to-destination {$dest}";
+            $lines[] = "iptables -t nat -A NEXOVIRT-PRE -i {$wan}{$pipA} -p {$proto} --dport {$pub} -j DNAT --to-destination {$dest}";
             $lines[] = "iptables -A NEXOVIRT-FWD -d {$dipA} -p {$proto} --dport {$dportA} -j ACCEPT";
         }
     }
 
     return implode("\n", $lines) . "\n";
+}
+
+/**
+ * NAT rules on the node that NexoVirt did not create: MASQUERADE / SNAT / DNAT outside the NEXOVIRT-*
+ * chains (iptables-save -t nat) and outside the NEXOVIRT-* chains / proxmox* tables (nft list ruleset).
+ * SNAT/MASQUERADE whose exact source is one of $ownSources (NexoVirt SDN subnets, written by Proxmox
+ * SDN) is not foreign. PURE. @param list<string> $ownSources @return list<string> the offending lines
+ */
+function nexovirt_nat_foreign_rules(string $iptablesSave, string $nftRuleset, array $ownSources): array
+{
+    $found = [];
+    $own   = static function (string $line, string $srcPattern) use ($ownSources): bool {
+        return preg_match($srcPattern, $line, $m) === 1 && in_array($m[1], $ownSources, true);
+    };
+
+    $table = '';
+    foreach (preg_split('/\r?\n/', $iptablesSave) ?: [] as $line) {
+        // `iptables-save -c` prefixes [packets:bytes]: the rule is the same (the panel planner strips it too).
+        $line = trim((string) preg_replace('/^\s*\[\d+:\d+\]\s+/', '', $line));
+        // iptables-nft cannot list a native nft nat table; without nft output those rules are unknown.
+        if ($nftRuleset === '' && preg_match('/^# Table `nat\' is incompatible/', $line) === 1) {
+            $found[] = $line;
+            continue;
+        }
+        if ($line !== '' && $line[0] === '*') {
+            $table = substr($line, 1);
+            continue;
+        }
+        if ($table !== 'nat' || preg_match('/^-A\s+(\S+)\s.*-j\s+(MASQUERADE|SNAT|DNAT)\b/', $line, $m) !== 1) {
+            continue;
+        }
+        if (strpos($m[1], 'NEXOVIRT-') === 0 || ($m[2] !== 'DNAT' && $own($line, '#\s-s\s+(\S+)#'))) {
+            continue;
+        }
+        $found[] = $line;
+    }
+
+    $nftTable = '';
+    $nftChain = '';
+    foreach (preg_split('/\r?\n/', $nftRuleset) ?: [] as $line) {
+        $line = trim($line);
+        if (preg_match('/^table\s+\S+\s+(\S+)\s*\{/', $line, $m) === 1) {
+            $nftTable = $m[1];
+            $nftChain = '';
+            continue;
+        }
+        if (preg_match('/^chain\s+(\S+)\s*\{/', $line, $m) === 1) {
+            $nftChain = trim($m[1], '"');
+            continue;
+        }
+        // Only NAT statements count: not a `ct status dnat` match and not text in a comment.
+        $stmt = preg_replace(['/\bct\s+status\s+\S+/i', '/\bcomment\s+"[^"]*"/i'], '', $line) ?? $line;
+        if (preg_match('/\b(masquerade|snat|dnat)\b/i', $stmt, $m) !== 1 || strpos($line, 'type ') === 0) {
+            continue;
+        }
+        if (strpos($nftChain, 'NEXOVIRT-') === 0 || strpos($nftTable, 'proxmox') !== false
+            || (strtolower($m[1]) !== 'dnat' && $own($line, '#\bip\s+saddr\s+(\S+)#'))) {
+            continue;
+        }
+        $found[] = $line;
+    }
+
+    return $found;
+}
+
+/**
+ * Read the node's NAT rule sets for the foreign-NAT check. ['ok'=>bool,'error'=>string,'ipt'=>string,'nft'=>string].
+ * Fails closed: an unreadable rule set is an error. DRYRUN seam: NEXOVIRT_AGENT_FAKE_IPT_NAT /
+ * NEXOVIRT_AGENT_FAKE_NFT hold the outputs (unit tests); nothing is executed.
+ */
+function nexovirt_nat_read_rulesets(): array
+{
+    if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1') {
+        return ['ok' => true, 'error' => '', 'ipt' => (string) getenv('NEXOVIRT_AGENT_FAKE_IPT_NAT'), 'nft' => (string) getenv('NEXOVIRT_AGENT_FAKE_NFT')];
+    }
+    $out  = [];
+    $code = 0;
+    exec('iptables-save -t nat 2>/dev/null', $out, $code);
+    if ($code !== 0) {
+        return ['ok' => false, 'error' => 'cannot read the node NAT rules (iptables-save failed); NAT not changed', 'ipt' => '', 'nft' => ''];
+    }
+    $ipt = implode("\n", $out);
+    // iptables-nft hides rules in legacy (x_tables) tables and only says so: read those too.
+    if (strpos($ipt, 'iptables-legacy tables present') !== false) {
+        $out  = [];
+        $code = 0;
+        exec('iptables-legacy-save -t nat 2>/dev/null', $out, $code);
+        if ($code !== 0) {
+            return ['ok' => false, 'error' => 'cannot read the node NAT rules (iptables-legacy-save failed); NAT not changed', 'ipt' => '', 'nft' => ''];
+        }
+        $ipt .= "\n" . implode("\n", $out);
+    }
+    $nft = '';
+    $has = [];
+    exec('command -v nft 2>/dev/null', $has);
+    if ($has !== []) {
+        $out  = [];
+        $code = 0;
+        exec('nft list ruleset 2>/dev/null', $out, $code);
+        if ($code !== 0) {
+            return ['ok' => false, 'error' => 'cannot read the node NAT rules (nft list ruleset failed); NAT not changed', 'ipt' => '', 'nft' => ''];
+        }
+        $nft = implode("\n", $out);
+    }
+
+    return ['ok' => true, 'error' => '', 'ipt' => $ipt, 'nft' => $nft];
+}
+
+// ---------------------------------------------------------------------------
+// NAT adoption inventory (nat_inventory, 0.24.3): READ-ONLY. Lists the live NAT/raw/filter rules (with
+// counters), the nft ruleset (with handles) and the lines of the persistent sources that can carry
+// NAT rules, plus optional TCP probes. Nothing is written or executed beyond list/save commands.
+// ---------------------------------------------------------------------------
+
+const NAT_INVENTORY_CAP        = 262144;
+const NAT_INVENTORY_MAX_PROBES = 32;
+const NAT_SOURCE_MAX_FILES     = 40;
+const NAT_SOURCE_MAX_LINES     = 2000;
+
+/**
+ * Rule-carrying lines of the persistent NAT sources under $root ('' = the real /): /etc/network/interfaces
+ * (+ interfaces.d), /etc/iptables/rules.v4 and /etc/nftables.conf (+ its includes). Each entry
+ * {path, kind: interfaces|rules_v4|nftables, lines: [{n, text}]}. Read-only, size-capped.
+ *
+ * @return list<array{path:string,kind:string,lines:list<array{n:int,text:string}>}>
+ */
+function nexovirt_nat_sources(string $root = ''): array
+{
+    $files = [['interfaces', '/etc/network/interfaces']];
+    foreach (glob($root . '/etc/network/interfaces.d/*') ?: [] as $f) {
+        $files[] = ['interfaces', substr($f, strlen($root))];
+    }
+    $files[] = ['rules_v4', '/etc/iptables/rules.v4'];
+    $files[] = ['nftables', '/etc/nftables.conf'];
+    $conf = is_readable($root . '/etc/nftables.conf') ? (string) @file_get_contents($root . '/etc/nftables.conf') : '';
+    if (preg_match_all('/^\s*include\s+"([^"]+)"/m', $conf, $m) > 0) {
+        foreach ($m[1] as $inc) {
+            $pattern = $inc[0] === '/' ? $inc : '/etc/' . $inc;
+            foreach (glob($root . $pattern) ?: [] as $f) {
+                $rel = substr($f, strlen($root));
+                if (strpos($rel, '/etc/') === 0 && strpos($rel, '/..') === false) { // never edit files outside /etc
+                    $files[] = ['nftables', $rel];
+                }
+            }
+        }
+    }
+    $match = [
+        'interfaces' => '/^\s*(post-up|pre-up|up|post-down|pre-down|down)\s.*\b(iptables|nft)\b/',
+        'rules_v4'   => '/^(\*|-A\s)/',
+        'nftables'   => '/\b(table|chain|masquerade|snat|dnat)\b/',
+    ];
+    $out  = [];
+    $seen = [];
+    foreach (array_slice($files, 0, NAT_SOURCE_MAX_FILES) as [$kind, $path]) {
+        if (isset($seen[$path]) || ! is_file($root . $path) || ! is_readable($root . $path)) {
+            continue;
+        }
+        $seen[$path] = true;
+        $body  = nexovirt_cap_output((string) @file_get_contents($root . $path), NAT_INVENTORY_CAP);
+        $lines = [];
+        foreach (preg_split('/\r?\n/', $body) ?: [] as $i => $text) {
+            if (preg_match($match[$kind], $text) === 1 && count($lines) < NAT_SOURCE_MAX_LINES) {
+                $lines[] = ['n' => $i + 1, 'text' => $text];
+            }
+        }
+        $out[] = ['path' => $path, 'kind' => $kind, 'lines' => $lines];
+    }
+
+    return $out;
+}
+
+/** The live rule sets for the inventory: iptables-save -c of nat/raw/filter (+ legacy tables) and nft -a. */
+function nexovirt_nat_inventory_rulesets(): array
+{
+    $ipt = '';
+    foreach (['nat', 'raw', 'filter'] as $t) {
+        $ipt .= nexovirt_run_cmd('iptables-save -c -t ' . $t) . "\n";
+    }
+    if (strpos($ipt, 'iptables-legacy tables present') !== false) {
+        foreach (['nat', 'raw', 'filter'] as $t) {
+            $ipt .= nexovirt_run_cmd('iptables-legacy-save -c -t ' . $t) . "\n";
+        }
+    }
+    $nft = nexovirt_bin_installed('nft') ? nexovirt_run_cmd('nft -a list ruleset') : '';
+
+    return [$ipt, $nft];
+}
+
+/**
+ * nat_inventory job. Payload {probes?: [{host: IPv4, port}]} (max 32, fail-closed). Returns
+ * ['ok'=>bool,'result'=>array|string]. DRYRUN seam: NEXOVIRT_AGENT_FAKE_IPT_NAT / NEXOVIRT_AGENT_FAKE_NFT hold
+ * the rule sets, NEXOVIRT_AGENT_ETC_ROOT the source tree, and no probe is run.
+ */
+function nexovirt_nat_inventory(array $p): array
+{
+    $probes = $p['probes'] ?? [];
+    if (! is_array($probes) || count($probes) > NAT_INVENTORY_MAX_PROBES) {
+        return ['ok' => false, 'result' => 'invalid nat_inventory payload'];
+    }
+    foreach ($probes as $pr) {
+        if (! is_array($pr) || filter_var((string) ($pr['host'] ?? ''), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false || ! nexovirt_validate_port($pr['port'] ?? 0)) {
+            return ['ok' => false, 'result' => 'invalid nat_inventory payload'];
+        }
+    }
+    $dry = getenv('NEXOVIRT_AGENT_DRYRUN') === '1';
+    if ($dry) {
+        $ipt  = (string) getenv('NEXOVIRT_AGENT_FAKE_IPT_NAT');
+        $nft  = (string) getenv('NEXOVIRT_AGENT_FAKE_NFT');
+        $root = (string) getenv('NEXOVIRT_AGENT_ETC_ROOT');
+    } else {
+        [$ipt, $nft] = nexovirt_nat_inventory_rulesets();
+        $root = '';
+    }
+    $results = [];
+    foreach ($probes as $pr) {
+        $host = (string) $pr['host'];
+        $port = (int) $pr['port'];
+        $res  = $dry ? ['reachable' => false, 'error' => 'dry run'] : json_decode(nexovirt_probe_tcp($host, $port, 2.0)['result'], true);
+        $results[] = ['host' => $host, 'port' => $port, 'reachable' => (bool) ($res['reachable'] ?? false), 'error' => (string) ($res['error'] ?? '')];
+    }
+
+    return ['ok' => true, 'result' => [
+        'iptables' => nexovirt_cap_output($ipt, NAT_INVENTORY_CAP),
+        'nft'      => nexovirt_cap_output($nft, NAT_INVENTORY_CAP),
+        'sources'  => nexovirt_nat_sources($root),
+        'scripts'  => nexovirt_nat_script_sources($root),
+        'probes'   => $results,
+    ]];
+}
+
+// ---------------------------------------------------------------------------
+// NAT adoption switch-off + restore (nat_adopt_finalize / nat_adopt_restore, 0.24.4).
+//
+// SAFETY CONTRACT: only the adopted rules the panel names are touched, each by EXACT match: an iptables
+// rule is checked with `-C <its stored spec>` and removed with `-D <the same spec>`, an nft rule by its
+// handle after its text was compared; a rule that no longer matches is reported and left alone. No
+// built-in chain or table is ever flushed or deleted; the ONLY chain deletion is a user chain whose
+// stored rules are exactly its live rules (jump removed first). Persistent sources come from the fixed
+// allowlist (nexovirt_nat_sources), are edited only after the live removal succeeded, only when every
+// named line still reads exactly as stored, with a timestamped backup next to the file that is never
+// overwritten, and by an atomic tmp + rename. systemd units are only disabled (never stopped/masked)
+// and only units nexovirt_nat_script_sources found. No ifreload, no service restart. Every value that
+// reaches a shell is escapeshellarg'd token by token.
+// ---------------------------------------------------------------------------
+
+const NAT_ADOPT_MAX_RULES  = 500;
+const NAT_ADOPT_MAX_CHAINS = 20;
+const NAT_ADOPT_MAX_FILES  = 40;
+const NAT_ADOPT_MAX_UNITS  = 10;
+const NAT_ADOPT_MAX_COUNT  = 64;
+const NAT_ADOPT_SCRIPT_CAP = 262144;
+
+/** Lines that hook a script into an interface, and the script/unit test for "sets NAT rules". PURE. */
+function nexovirt_nat_text_sets_nat(string $s): bool
+{
+    return preg_match('/\b(iptables|nft)\b/', $s) === 1 && preg_match('/(-t\s+nat\b|\bnat\b|MASQUERADE|DNAT|SNAT|masquerade|dnat|snat)/', $s) === 1;
+}
+
+/** The script a unit's Exec value runs ('' when it is not an absolute path). PURE. */
+function nexovirt_nat_exec_path(string $exec): string
+{
+    $first = (string) (preg_split('/\s+/', ltrim($exec, " \t-@+!:")) ?: [''])[0];
+
+    return preg_match('#^/[A-Za-z0-9_./+-]{1,255}$#', $first) === 1 && strpos($first, '..') === false ? $first : '';
+}
+
+function nexovirt_nat_script_sets_nat(string $root, string $script): bool
+{
+    $f = $root . $script;
+    if ($script === '' || ! is_file($f) || ! is_readable($f) || (int) @filesize($f) > NAT_ADOPT_SCRIPT_CAP) {
+        return false;
+    }
+
+    return nexovirt_nat_text_sets_nat((string) @file_get_contents($f));
+}
+
+/**
+ * Script sources: interfaces hook lines (post-up/up/pre-up/pre-down/down/post-down) that run a script
+ * which sets NAT rules, and /etc/systemd/system units whose Exec lines set NAT rules directly or through
+ * such a script (nexovirt-* units excluded). Read-only.
+ *
+ * @return list<array<string,mixed>> {kind: interfaces, path, n, text, script} | {kind: systemd, path, unit, script}
+ */
+function nexovirt_nat_script_sources(string $root = ''): array
+{
+    $out = [];
+    foreach (nexovirt_nat_sources($root) as $src) {
+        if ($src['kind'] !== 'interfaces') {
+            continue;
+        }
+        $body = (string) @file_get_contents($root . $src['path']);
+        foreach (preg_split('/\r?\n/', nexovirt_cap_output($body, NAT_INVENTORY_CAP)) ?: [] as $i => $text) {
+            if (preg_match('/^\s*(post-up|pre-up|up|pre-down|down|post-down)\s+(\/\S+)/', $text, $m) !== 1 || preg_match('/\b(iptables|nft)\b/', $text) === 1) {
+                continue;
+            }
+            $script = nexovirt_nat_exec_path($m[2]);
+            if ($script !== '' && nexovirt_nat_script_sets_nat($root, $script)) {
+                $out[] = ['kind' => 'interfaces', 'path' => $src['path'], 'n' => $i + 1, 'text' => $text, 'script' => $script];
+            }
+        }
+    }
+    foreach (array_slice(glob($root . '/etc/systemd/system/*.service') ?: [], 0, 200) as $f) {
+        $unit = basename($f);
+        if (strpos($unit, 'nexovirt-') === 0 || ! is_file($f) || (int) @filesize($f) > NAT_ADOPT_SCRIPT_CAP) {
+            continue;
+        }
+        if (preg_match_all('/^\s*(ExecStart|ExecStartPre|ExecStartPost)\s*=\s*(.+)$/m', (string) @file_get_contents($f), $m) < 1) {
+            continue;
+        }
+        foreach ($m[2] as $exec) {
+            if (nexovirt_nat_text_sets_nat($exec) || nexovirt_nat_script_sets_nat($root, nexovirt_nat_exec_path($exec))) {
+                $out[] = ['kind' => 'systemd', 'path' => substr($f, strlen($root)), 'unit' => $unit, 'script' => trim($exec)];
+                break;
+            }
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * Shell-like tokens of an iptables-save line: "double" quotes with \" escapes, 'single' quotes. null when
+ * the line does not split cleanly (same rules as the panel's NatRule::tokens). PURE.
+ *
+ * @return list<string>|null
+ */
+function nexovirt_nat_tokens(string $s): ?array
+{
+    $n = preg_match_all('/\G\s*(?:"((?:[^"\\\\]|\\\\.)*)"|\'([^\']*)\'|([^\s"\'\\\\]+))(?=\s|$)/', $s, $m, PREG_SET_ORDER | PREG_UNMATCHED_AS_NULL);
+    $used = 0;
+    $out  = [];
+    foreach ($m as $t) {
+        $used += strlen($t[0]);
+        $out[] = $t[1] !== null ? (string) preg_replace('/\\\\(.)/', '$1', $t[1]) : (string) ($t[3] ?? $t[2]);
+    }
+
+    return $n === false || trim(substr($s, $used)) !== '' ? null : $out;
+}
+
+function nexovirt_nat_printable(string $s, int $max = 1000): bool
+{
+    return $s !== '' && strlen($s) <= $max && preg_match('/^[\x20-\x7e]+$/', $s) === 1;
+}
+
+/** An iptables user chain the switch-off may flush + delete. PURE. */
+function nexovirt_nat_user_chain(string $c): bool
+{
+    return preg_match('/^[A-Za-z0-9_.-]{1,28}$/', $c) === 1
+        && ! in_array($c, ['PREROUTING', 'POSTROUTING', 'INPUT', 'OUTPUT', 'FORWARD', 'ACCEPT', 'DROP', 'RETURN', 'REJECT', 'MASQUERADE', 'SNAT', 'DNAT', 'CT', 'LOG', 'MARK'], true)
+        && strpos($c, 'PVEFW-') !== 0 && strpos($c, 'NEXOVIRT-') !== 0;
+}
+
+/**
+ * One stored iptables-save rule line ('[p:b] -A CHAIN ...', exactly as nat_inventory returned it) as argv tokens after the op, or null when it is
+ * not exactly one append of a plain rule (no other table/chain operation, no NEXOVIRT-* chain). PURE.
+ *
+ * @return array{chain:string,args:list<string>}|null
+ */
+function nexovirt_nat_rule_args(string $line): ?array
+{
+    // The exact line nat_inventory returned; `iptables-save -c` prefixes [packets:bytes].
+    $line = (string) preg_replace('/^\[\d+:\d+\]\s+/', '', trim($line));
+    if (! nexovirt_nat_printable($line) || strpos($line, '-A ') !== 0) {
+        return null;
+    }
+    $t = nexovirt_nat_tokens($line);
+    if ($t === null || count($t) < 3 || preg_match('/^[A-Za-z0-9_.+-]{1,28}$/', $t[1]) !== 1 || strpos($t[1], 'NEXOVIRT-') === 0) {
+        return null;
+    }
+    $ops = ['-A', '--append', '-D', '--delete', '-I', '--insert', '-R', '--replace', '-F', '--flush', '-X', '--delete-chain',
+        '-Z', '--zero', '-N', '--new-chain', '-P', '--policy', '-E', '--rename-chain', '-t', '--table', '-C', '--check', '-L', '-S', '-M'];
+    $args = array_slice($t, 2);
+    foreach ($args as $a) {
+        // --modprobe=<program> (or any getopt abbreviation of it) makes iptables EXECUTE a program as root;
+        // combined short options (-vM/x) could smuggle -M or a second command past the list above.
+        $opt = explode('=', $a, 2)[0];
+        if (in_array($a, $ops, true) || $a === '' || (strlen($opt) >= 4 && strncmp('--modprobe', $opt, strlen($opt)) === 0)
+            || preg_match('/^-[^-]./', $a) === 1) {
+            return null;
+        }
+    }
+
+    return ['chain' => $t[1], 'args' => $args];
+}
+
+/** iptables command for $op (-C|-D|-A) on a stored rule line in $table. PURE. */
+function nexovirt_nat_rule_cmd(string $op, string $table, array $rule): string
+{
+    $parts = ['iptables', '-w', '-t', escapeshellarg($table), $op, escapeshellarg($rule['chain'])];
+    foreach ($rule['args'] as $a) {
+        $parts[] = escapeshellarg($a);
+    }
+
+    return implode(' ', $parts);
+}
+
+/** The jump/goto target of a parsed iptables rule, or ''. PURE. */
+function nexovirt_nat_rule_target(array $rule): string
+{
+    foreach ($rule['args'] as $i => $arg) {
+        if (in_array($arg, ['-j', '--jump', '-g', '--goto'], true)) {
+            return (string) ($rule['args'][$i + 1] ?? '');
+        }
+    }
+
+    return '';
+}
+
+/**
+ * What the switch-off may remove or the restore re-add: only the rule kinds NAT adoption takes over.
+ * nat: DNAT/SNAT/MASQUERADE in PREROUTING/POSTROUTING or a user chain (chain jumps go through the
+ * checked chain step only); raw: the PREROUTING CT zone rule; filter: FORWARD accepts. Never a
+ * PVEFW-* chain, never INPUT/OUTPUT, never a DROP/REJECT. PURE.
+ */
+function nexovirt_nat_adopt_scope_ok(string $table, array $rule): bool
+{
+    $chain  = $rule['chain'];
+    $target = nexovirt_nat_rule_target($rule);
+    if (strpos($chain, 'PVEFW-') === 0) {
+        return false;
+    }
+    if ($table === 'nat') {
+        return in_array($target, ['DNAT', 'SNAT', 'MASQUERADE'], true)
+            && (in_array($chain, ['PREROUTING', 'POSTROUTING'], true) || nexovirt_nat_user_chain($chain));
+    }
+    if ($table === 'raw') {
+        return $chain === 'PREROUTING' && $target === 'CT';
+    }
+
+    return $table === 'filter' && $chain === 'FORWARD' && $target === 'ACCEPT';
+}
+
+/** nft rule text without the handle comment and counter values, single-spaced. PURE. */
+function nexovirt_nat_nft_norm(string $s): string
+{
+    $s = (string) preg_replace('/\s*#\s*handle\s+\d+\s*$/', '', trim($s));
+    $s = (string) preg_replace('/\bcounter\s+packets\s+\d+\s+bytes\s+\d+/', 'counter', $s);
+
+    return trim((string) preg_replace('/\s+/', ' ', $s));
+}
+
+function nexovirt_nat_nft_name(string $s): bool
+{
+    return preg_match('/^[A-Za-z0-9_.-]{1,64}$/', $s) === 1;
+}
+
+/**
+ * Validate a finalize/restore payload. Returns ['ok'=>bool,'error'=>string,'rules'=>..., 'chains'=>...,
+ * 'files'=>..., 'units'=>...] with the parsed rules. $allowedFiles: path => kind; $allowedUnits: names.
+ */
+function nexovirt_nat_adopt_validate(array $p, array $allowedFiles, array $allowedUnits, bool $restore): array
+{
+    $bad = static function (string $why): array {
+        return ['ok' => false, 'error' => 'invalid NAT adoption payload: ' . $why];
+    };
+    foreach (['rules', 'chains', 'files', 'units', 'require'] as $k) {
+        if (isset($p[$k]) && ! is_array($p[$k])) {
+            return $bad($k);
+        }
+    }
+    // NexoVirt's own replacement rules that must be live before anything is switched off (compared as text only).
+    $require = [];
+    foreach (array_values((array) ($p['require'] ?? [])) as $i => $line) {
+        $line = is_string($line) ? trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', trim($line))) : '';
+        if ($i >= NAT_ADOPT_MAX_RULES || ! nexovirt_nat_printable($line) || preg_match('/^-A NEXOVIRT-(PRE|POST|FWD) /', $line) !== 1) {
+            return $bad('require');
+        }
+        $require[] = $line;
+    }
+    $rules = [];
+    foreach (array_values((array) ($p['rules'] ?? [])) as $i => $r) {
+        if ($i >= NAT_ADOPT_MAX_RULES || ! is_array($r)) {
+            return $bad('rules');
+        }
+        $count = (int) ($r['count'] ?? 1);
+        if ($count < 1 || $count > NAT_ADOPT_MAX_COUNT) {
+            return $bad('rule count');
+        }
+        if (($r['kind'] ?? '') === 'ipt') {
+            $table = (string) ($r['table'] ?? '');
+            $rule  = nexovirt_nat_rule_args((string) ($r['line'] ?? ''));
+            if (! in_array($table, ['nat', 'raw', 'filter'], true) || $rule === null || ! nexovirt_nat_adopt_scope_ok($table, $rule)) {
+                return $bad('iptables rule ' . $i);
+            }
+            $rules[] = ['kind' => 'ipt', 'table' => $table, 'rule' => $rule, 'line' => (string) $r['line'], 'count' => $count];
+        } elseif (($r['kind'] ?? '') === 'nft') {
+            $body = nexovirt_nat_nft_norm((string) ($r['body'] ?? ''));
+            if (! in_array($r['family'] ?? '', ['ip', 'inet'], true) || ! nexovirt_nat_nft_name((string) ($r['table'] ?? '')) || ! nexovirt_nat_nft_name((string) ($r['chain'] ?? ''))
+                || ! is_int($r['handle'] ?? null) || $r['handle'] < 1 || ! nexovirt_nat_printable($body) || preg_match('/[;{}#\\\\]/', $body) === 1
+                || preg_match('/\b(masquerade|snat|dnat)\b/', $body) !== 1
+                || strpos((string) $r['table'], 'proxmox') !== false || strpos((string) $r['chain'], 'NEXOVIRT-') === 0) {
+                return $bad('nft rule ' . $i);
+            }
+            $rules[] = ['kind' => 'nft', 'family' => $r['family'], 'table' => (string) $r['table'], 'chain' => (string) $r['chain'], 'handle' => $r['handle'], 'body' => $body, 'count' => 1];
+        } else {
+            return $bad('rule kind');
+        }
+    }
+    $chains = [];
+    foreach (array_values((array) ($p['chains'] ?? [])) as $i => $c) {
+        $name = (string) ($c['chain'] ?? '');
+        $jump = nexovirt_nat_rule_args((string) ($c['jump'] ?? ''));
+        if ($i >= NAT_ADOPT_MAX_CHAINS || ($c['table'] ?? '') !== 'nat' || ! nexovirt_nat_user_chain($name) || $jump === null
+            || $jump['chain'] !== 'PREROUTING' || nexovirt_nat_rule_target($jump) !== $name || ! is_array($c['rules'] ?? null) || $c['rules'] === [] || count($c['rules']) > NAT_ADOPT_MAX_RULES) {
+            return $bad('chain ' . $i);
+        }
+        $lines = [];
+        foreach ($c['rules'] as $line) {
+            $rule = nexovirt_nat_rule_args((string) $line);
+            if ($rule === null || $rule['chain'] !== $name || nexovirt_nat_rule_target($rule) !== 'DNAT') {
+                return $bad('chain rule of ' . $name);
+            }
+            $lines[] = ['line' => (string) $line, 'rule' => $rule];
+        }
+        $chains[] = ['chain' => $name, 'jump' => $jump, 'jump_line' => (string) $c['jump'], 'rules' => $lines];
+    }
+    $files = [];
+    foreach (array_values((array) ($p['files'] ?? [])) as $i => $f) {
+        $path = (string) ($f['path'] ?? '');
+        if ($i >= NAT_ADOPT_MAX_FILES || ! isset($allowedFiles[$path])) {
+            return $bad('file ' . $path);
+        }
+        if ($restore) {
+            $backup = (string) ($f['backup'] ?? '');
+            $stamp  = substr($backup, -15);
+            if (! in_array($backup, [nexovirt_nat_backup_path($path, $stamp), $path . '.nexovirt-adopted-' . $stamp], true) || preg_match('/^\d{8}-\d{6}$/', $stamp) !== 1
+                || preg_match('/^[0-9a-f]{64}$/', (string) ($f['sha256'] ?? '')) !== 1) {
+                return $bad('backup of ' . $path);
+            }
+            $files[] = ['path' => $path, 'backup' => $backup, 'sha256' => (string) $f['sha256']];
+            continue;
+        }
+        $mode = $allowedFiles[$path] === 'rules_v4' ? 'remove' : 'comment';
+        if (($f['mode'] ?? '') !== $mode || ! is_array($f['lines'] ?? null) || $f['lines'] === [] || count($f['lines']) > NAT_SOURCE_MAX_LINES) {
+            return $bad('lines of ' . $path);
+        }
+        $lines = [];
+        foreach ($f['lines'] as $l) {
+            $n    = $l['n'] ?? null;
+            $text = (string) ($l['text'] ?? '');
+            if (! is_int($n) || $n < 1 || $text === '' || strpbrk($text, "\r\n\0") !== false || strlen($text) > 4096) {
+                return $bad('line of ' . $path);
+            }
+            $lines[$n] = $text;
+        }
+        $files[] = ['path' => $path, 'mode' => $mode, 'lines' => $lines];
+    }
+    $units = [];
+    foreach (array_values((array) ($p['units'] ?? [])) as $i => $u) {
+        if ($i >= NAT_ADOPT_MAX_UNITS || ! is_string($u) || preg_match('/^[A-Za-z0-9@._-]{1,100}\.service$/', $u) !== 1 || ! in_array($u, $allowedUnits, true)) {
+            return $bad('unit');
+        }
+        $units[] = $u;
+    }
+
+    return ['ok' => true, 'error' => '', 'rules' => $rules, 'chains' => $chains, 'files' => $files, 'units' => $units, 'require' => $require];
+}
+
+/**
+ * The source lines a switch-off may edit, from this agent's own scan: path => [n => text]. interfaces:
+ * hook lines running iptables/nft or a NAT script; rules.v4: `-A` lines inside the switch-off scope of
+ * their table; nftables: single rule lines with a NAT statement (never a table/chain/brace line).
+ *
+ * @return array<string,array<int,string>>
+ */
+function nexovirt_nat_adopt_scanned_lines(string $root): array
+{
+    $out = [];
+    foreach (nexovirt_nat_sources($root) as $src) {
+        $table = '';
+        if ($src['kind'] === 'rules_v4') {
+            $body = (string) @file_get_contents($root . $src['path']);
+            foreach (preg_split('/\r?\n/', nexovirt_cap_output($body, NAT_INVENTORY_CAP)) ?: [] as $i => $text) {
+                if (preg_match('/^\*(\w+)/', $text, $m) === 1) {
+                    $table = $m[1];
+                    continue;
+                }
+                $rule = nexovirt_nat_rule_args($text);
+                if ($rule !== null && nexovirt_nat_adopt_scope_ok($table, $rule)) {
+                    $out[$src['path']][$i + 1] = $text;
+                }
+            }
+            continue;
+        }
+        foreach ($src['lines'] as $l) {
+            if ($src['kind'] === 'interfaces'
+                || (strpbrk($l['text'], '{}') === false && preg_match('/^\s*(table|chain)\b/', $l['text']) !== 1 && preg_match('/\b(masquerade|snat|dnat)\b/', $l['text']) === 1)) {
+                $out[$src['path']][$l['n']] = $l['text'];
+            }
+        }
+    }
+    foreach (nexovirt_nat_script_sources($root) as $sc) {
+        if ($sc['kind'] === 'interfaces') {
+            $out[$sc['path']][$sc['n']] = $sc['text'];
+        }
+    }
+
+    return $out;
+}
+
+/** The default command runner: [exit code, output]. */
+function nexovirt_nat_adopt_exec(string $cmd): array
+{
+    $out  = [];
+    $code = 0;
+    exec($cmd . ' 2>&1', $out, $code);
+
+    return [$code, implode("\n", $out)];
+}
+
+/**
+ * Backup next to the file, as a dot file: `source /etc/network/interfaces.d/*` and nft `include "dir/*"`
+ * wildcards skip it, so a backup never brings the old rules (or a second iface stanza) back at boot. PURE.
+ */
+function nexovirt_nat_backup_path(string $path, string $stamp): string
+{
+    return dirname($path) . '/.' . basename($path) . '.nexovirt-adopted-' . $stamp;
+}
+
+/** Create $file with $content; fails when anything (a file or a symlink, even a dangling one) is already there. */
+function nexovirt_nat_write_new(string $file, string $content, int $mode = 0600): bool
+{
+    // PHP's 'x' resolves a dangling symlink and creates its target, so refuse any existing entry first.
+    $h = is_link($file) || file_exists($file) ? false : @fopen($file, 'x');
+    if ($h === false) {
+        return false;
+    }
+    $ok = @fwrite($h, $content) === strlen($content) && @fflush($h);
+    @fclose($h);
+    @chmod($file, $mode);
+    if (! $ok) {
+        @unlink($file);
+    }
+
+    return $ok;
+}
+
+/** Atomic write (tmp + rename on the same filesystem) keeping mode and owner; a symlinked file is written at its target. */
+function nexovirt_nat_atomic_write(string $file, string $content): bool
+{
+    if (is_link($file)) {
+        $file = realpath($file);
+        if ($file === false) {
+            return false;
+        }
+    }
+    $tmp = dirname($file) . '/.' . basename($file) . '.nexovirt-tmp-' . getmypid() . '-' . bin2hex(random_bytes(4)); // hidden from wildcard includes
+    $st  = @stat($file);
+    if (! nexovirt_nat_write_new($tmp, $content, $st !== false ? $st['mode'] & 0777 : 0644)) {
+        @unlink($tmp);
+
+        return false;
+    }
+    if ($st !== false) {
+        @chown($tmp, $st['uid']);
+        @chgrp($tmp, $st['gid']);
+    }
+    if (! @rename($tmp, $file)) {
+        @unlink($tmp);
+
+        return false;
+    }
+
+    return true;
+}
+
+/** Remove the live rules of a finalize payload. @return list<array<string,mixed>> per rule */
+function nexovirt_nat_adopt_remove_rules(array $rules, callable $run): array
+{
+    $report = [];
+    foreach ($rules as $r) {
+        if ($r['kind'] === 'ipt') {
+            $removed = 0;
+            $status  = 'removed';
+            $detail  = '';
+            for ($i = 0; $i < $r['count']; $i++) {
+                if ($run(nexovirt_nat_rule_cmd('-C', $r['table'], $r['rule']))[0] !== 0) {
+                    $status = $removed > 0 ? 'removed' : 'missing';
+                    $detail = $removed > 0 ? '' : 'The rule no longer matches exactly on the node; it was not touched.';
+                    break;
+                }
+                [$code, $out] = $run(nexovirt_nat_rule_cmd('-D', $r['table'], $r['rule']));
+                if ($code !== 0) {
+                    $status = 'failed';
+                    $detail = trim($out);
+                    break;
+                }
+                $removed++;
+            }
+            $report[] = ['kind' => 'ipt', 'table' => $r['table'], 'line' => $r['line'], 'status' => $status, 'removed' => $removed, 'detail' => $detail];
+            continue;
+        }
+        $where = escapeshellarg($r['family']) . ' ' . escapeshellarg($r['table']) . ' ' . escapeshellarg($r['chain']);
+        [$code, $list] = $run('nft -a list chain ' . $where);
+        $match = false;
+        foreach (preg_split('/\r?\n/', $list) ?: [] as $line) {
+            if (preg_match('/#\s*handle\s+' . $r['handle'] . '\s*$/', $line) === 1 && nexovirt_nat_nft_norm($line) === $r['body']) {
+                $match = true;
+            }
+        }
+        $row = ['kind' => 'nft', 'family' => $r['family'], 'table' => $r['table'], 'chain' => $r['chain'], 'handle' => $r['handle'], 'body' => $r['body'], 'removed' => 0];
+        if ($code !== 0 || ! $match) {
+            $report[] = $row + ['status' => 'missing', 'detail' => 'The rule no longer matches exactly on the node; it was not touched.'];
+            continue;
+        }
+        [$code, $out] = $run('nft delete rule ' . $where . ' handle ' . escapeshellarg((string) $r['handle']));
+        $report[] = $row + ($code === 0 ? ['status' => 'removed', 'removed' => 1, 'detail' => ''] : ['status' => 'failed', 'detail' => trim($out)]);
+    }
+
+    return $report;
+}
+
+/** Live rules of one iptables chain in iptables-save form, counters dropped. @return list<string> */
+function nexovirt_nat_chain_lines(string $save, string $chain): array
+{
+    $out = [];
+    foreach (preg_split('/\r?\n/', $save) ?: [] as $line) {
+        $line = trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', trim($line)));
+        if (strpos($line, '-A ' . $chain . ' ') === 0) {
+            $out[] = $line;
+        }
+    }
+
+    return $out;
+}
+
+/** Every live rule that jumps/gotos $target, normalized to iptables-save text. @return list<string> */
+function nexovirt_nat_chain_references(string $save, string $target): array
+{
+    $out = [];
+    $re  = '/(^|\s)(-j|--jump|-g|--goto)\s+["\']?' . preg_quote($target, '/') . '["\']?(\s|$)/';
+    foreach (preg_split('/\r?\n/', $save) ?: [] as $line) {
+        $line = trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', trim($line)));
+        // Text match, not the parser: a line the parser refuses still references the chain.
+        if (strpos($line, '-A ') === 0 && preg_match($re, $line) === 1) {
+            $out[] = $line;
+        }
+    }
+
+    return $out;
+}
+
+/** Remove fully adopted user chains: jump first, then flush + delete that one chain. */
+function nexovirt_nat_adopt_remove_chains(array $chains, callable $run): array
+{
+    $report = [];
+    foreach ($chains as $c) {
+        $row = ['chain' => $c['chain'], 'jump' => $c['jump_line'], 'rules' => array_column($c['rules'], 'line')];
+        [$code, $save] = $run('iptables-save -t nat');
+        $stored = array_map(static function (array $r): string {
+            return trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', $r['line']));
+        }, $c['rules']);
+        $live = nexovirt_nat_chain_lines($save, $c['chain']);
+        $jumpLine = trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', $c['jump_line']));
+        $refs = nexovirt_nat_chain_references($save, $c['chain']);
+        if ($code !== 0 || $live !== $stored || $refs !== [$jumpLine] || $run(nexovirt_nat_rule_cmd('-C', 'nat', $c['jump']))[0] !== 0) {
+            $report[] = $row + ['status' => 'missing', 'detail' => 'The chain or its jump changed on the node; nothing in it was touched.'];
+            continue;
+        }
+        $name = escapeshellarg($c['chain']);
+        $steps = [['jump', nexovirt_nat_rule_cmd('-D', 'nat', $c['jump'])], ['flush', 'iptables -w -t nat -F ' . $name], ['delete', 'iptables -w -t nat -X ' . $name]];
+        $done = [];
+        foreach ($steps as [$step, $cmd]) {
+            [$code, $out] = $run($cmd);
+            if ($code !== 0) {
+                $report[] = $row + ['status' => 'failed', 'changed' => $done !== [], 'steps' => $done, 'detail' => trim($out)];
+                continue 2;
+            }
+            $done[] = $step;
+        }
+        $report[] = $row + ['status' => 'removed', 'changed' => true, 'steps' => $done, 'detail' => ''];
+    }
+
+    return $report;
+}
+
+/** Comment out / drop the named lines of each file, with a backup first. */
+function nexovirt_nat_adopt_edit_files(array $files, string $root, string $stamp, string $date, array $scanned): array
+{
+    $report = [];
+    foreach ($files as $f) {
+        $real = $root . $f['path'];
+        $row  = ['path' => $f['path'], 'mode' => $f['mode'], 'lines' => array_keys($f['lines'])];
+        $body = @file_get_contents($real);
+        if (! is_string($body)) {
+            $report[] = $row + ['status' => 'failed', 'detail' => 'The file cannot be read.'];
+            continue;
+        }
+        $lines   = explode("\n", $body);
+        $changed = [];
+        foreach ($f['lines'] as $n => $text) {
+            // Only a line this agent's own scan lists as a NAT rule / NAT script hook of this file.
+            if (($lines[$n - 1] ?? null) !== $text || ($scanned[$f['path']][$n] ?? null) !== $text) {
+                $changed[] = $n;
+            }
+        }
+        if ($changed !== []) {
+            $report[] = $row + ['status' => 'changed', 'detail' => 'Line ' . implode(', ', $changed) . ' no longer reads as scanned (or is not a NAT rule line); the file was not edited.'];
+            continue;
+        }
+        $backup = nexovirt_nat_backup_path($f['path'], $stamp);
+        if (! nexovirt_nat_write_new($root . $backup, $body)) {
+            $report[] = $row + ['status' => 'failed', 'detail' => 'The backup ' . $backup . ' could not be written; the file was not edited.'];
+            continue;
+        }
+        foreach ($f['lines'] as $n => $text) {
+            if ($f['mode'] === 'remove') {
+                $lines[$n - 1] = null;
+            } else {
+                preg_match('/^\s*/', $text, $ws);
+                $lines[$n - 1] = $ws[0] . '# nexovirt-adopted ' . $date . ': ' . ltrim($text);
+            }
+        }
+        $new = implode("\n", array_filter($lines, static function ($l): bool {
+            return $l !== null;
+        }));
+        if (! nexovirt_nat_atomic_write($real, $new)) {
+            $report[] = $row + ['status' => 'failed', 'backup' => $backup, 'detail' => 'The file could not be written; it is unchanged.'];
+            continue;
+        }
+        $report[] = $row + ['status' => 'edited', 'backup' => $backup, 'sha256' => hash('sha256', $new), 'detail' => ''];
+    }
+
+    return $report;
+}
+
+/**
+ * nat_adopt_finalize: switch the adopted original rules off. Payload {rules, chains, files, units}.
+ * Live removal first; files and units only when no live removal failed. Returns ['ok'=>bool,
+ * 'result'=>report|error]. The report ends with a fresh read of the rule sets ('after').
+ */
+function nexovirt_nat_adopt_finalize(array $p, string $root = '', ?callable $run = null, ?int $now = null): array
+{
+    $run   = $run ?? 'nexovirt_nat_adopt_exec';
+    $now   = $now ?? time();
+    $files = [];
+    foreach (nexovirt_nat_sources($root) as $s) {
+        $files[$s['path']] = $s['kind'];
+    }
+    $units = array_column(array_filter(nexovirt_nat_script_sources($root), static function (array $s): bool {
+        return $s['kind'] === 'systemd';
+    }), 'unit');
+    $v = nexovirt_nat_adopt_validate($p, $files, $units, false);
+    if (! $v['ok']) {
+        return ['ok' => false, 'result' => $v['error']];
+    }
+    if ($v['require'] !== []) {
+        [$code, $save] = $run('iptables-save -t nat');
+        $live = array_flip(array_map(static function (string $l): string {
+            return trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', trim($l)));
+        }, preg_split('/\r?\n/', (string) $save) ?: []));
+        $missing = array_values(array_filter($v['require'], static function (string $l) use ($live): bool {
+            return ! isset($live[$l]);
+        }));
+        if ($code !== 0 || $missing !== []) {
+            return ['ok' => false, 'result' => 'NexoVirt\'s replacement rules are not all active on the node' . ($missing !== [] ? ' (missing: ' . $missing[0] . ')' : '')
+                . '; nothing was switched off. Apply the NAT settings again, then retry.'];
+        }
+    }
+    $report = ['stamp' => gmdate('Ymd-His', $now)];
+    $report['chains'] = nexovirt_nat_adopt_remove_chains($v['chains'], $run);
+    $report['rules']  = nexovirt_nat_adopt_remove_rules($v['rules'], $run);
+    $failed = in_array('failed', array_merge(array_column($report['rules'], 'status'), array_column($report['chains'], 'status')), true);
+    $report['files'] = [];
+    $report['units'] = [];
+    if ($failed) {
+        foreach ($v['files'] as $f) {
+            $report['files'][] = ['path' => $f['path'], 'mode' => $f['mode'], 'lines' => array_keys($f['lines']), 'status' => 'skipped', 'detail' => 'A live rule could not be removed, so no file was edited.'];
+        }
+        foreach ($v['units'] as $u) {
+            $report['units'][] = ['unit' => $u, 'status' => 'skipped', 'detail' => 'A live rule could not be removed.'];
+        }
+    } else {
+        $report['files'] = nexovirt_nat_adopt_edit_files($v['files'], $root, $report['stamp'], gmdate('Y-m-d', $now), nexovirt_nat_adopt_scanned_lines($root));
+        foreach ($v['units'] as $u) {
+            [, $state] = $run('systemctl is-enabled ' . escapeshellarg($u));
+            if (trim($state) !== 'enabled') {
+                $report['units'][] = ['unit' => $u, 'status' => 'not_enabled', 'detail' => 'The unit was not enabled; it was left as is.'];
+                continue;
+            }
+            [$code, $out] = $run('systemctl disable ' . escapeshellarg($u));
+            $report['units'][] = ['unit' => $u, 'status' => $code === 0 ? 'disabled' : 'failed', 'detail' => $code === 0 ? '' : trim($out)];
+        }
+    }
+    $report['after'] = nexovirt_nat_adopt_read_after($run);
+    $statuses = array_merge(array_column($report['rules'], 'status'), array_column($report['chains'], 'status'),
+        array_column($report['files'], 'status'), array_column($report['units'], 'status'));
+    $report['complete'] = array_diff($statuses, ['removed', 'missing', 'edited', 'disabled', 'not_enabled']) === [];
+
+    return ['ok' => true, 'result' => $report];
+}
+
+/** A fresh read of the rule sets after a switch-off / restore (nat, raw, filter + nft). */
+function nexovirt_nat_adopt_read_after(callable $run): array
+{
+    $ipt = '';
+    $ok  = true;
+    foreach (['nat', 'raw', 'filter'] as $t) {
+        [$code, $out] = $run('iptables-save -t ' . $t);
+        $ok = $ok && $code === 0;
+        $ipt .= $out . "\n";
+    }
+    [$code, $nft] = $run('nft -a list ruleset');
+    $ok = $ok && $code === 0;
+
+    return ['ok' => $ok, 'iptables' => nexovirt_cap_output($ipt, NAT_INVENTORY_CAP), 'nft' => $code === 0 ? nexovirt_cap_output($nft, NAT_INVENTORY_CAP) : ''];
+}
+
+/**
+ * nat_adopt_restore: put the original rules back. Payload {rules, chains, files: [{path, backup,
+ * sha256}], units}. A file is restored from its backup only while it still holds exactly what the
+ * switch-off wrote (sha256); live rules are re-added only when absent (idempotent).
+ */
+function nexovirt_nat_adopt_restore(array $p, string $root = '', ?callable $run = null): array
+{
+    $run   = $run ?? 'nexovirt_nat_adopt_exec';
+    $files = [];
+    foreach (nexovirt_nat_sources($root) as $s) {
+        $files[$s['path']] = $s['kind'];
+    }
+    $units = array_column(array_filter(nexovirt_nat_script_sources($root), static function (array $s): bool {
+        return $s['kind'] === 'systemd';
+    }), 'unit');
+    $v = nexovirt_nat_adopt_validate($p, $files, $units, true);
+    if (! $v['ok']) {
+        return ['ok' => false, 'result' => $v['error']];
+    }
+    $report = ['files' => [], 'chains' => [], 'rules' => [], 'units' => []];
+    foreach ($v['files'] as $f) {
+        $real = $root . $f['path'];
+        $now  = @file_get_contents($real);
+        $orig = @file_get_contents($root . $f['backup']);
+        if (! is_string($orig)) {
+            $report['files'][] = ['path' => $f['path'], 'status' => 'failed', 'detail' => 'The backup ' . $f['backup'] . ' is missing.'];
+        } elseif (is_string($now) && hash_equals(hash('sha256', $orig), hash('sha256', $now))) {
+            $report['files'][] = ['path' => $f['path'], 'status' => 'present', 'detail' => ''];
+        } elseif (! is_string($now) || hash('sha256', $now) !== $f['sha256']) {
+            $report['files'][] = ['path' => $f['path'], 'status' => 'changed', 'detail' => 'The file was edited after the switch-off; it was not restored. The backup is ' . $f['backup'] . '.'];
+        } else {
+            $ok = nexovirt_nat_atomic_write($real, $orig);
+            $report['files'][] = ['path' => $f['path'], 'status' => $ok ? 'restored' : 'failed', 'detail' => $ok ? '' : 'The file could not be written.'];
+        }
+    }
+    foreach ($v['chains'] as $c) {
+        $name = escapeshellarg($c['chain']);
+        [$saveCode, $save] = $run('iptables-save -t nat');
+        $declared = preg_match('/^:' . preg_quote($c['chain'], '/') . '\s/m', $save) === 1;
+        $wanted = array_map(static function (array $r): string {
+            return trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', $r['line']));
+        }, $c['rules']);
+        $live = nexovirt_nat_chain_lines($save, $c['chain']);
+        $wantedCounts = array_count_values($wanted);
+        $liveCounts = array_count_values($live);
+        $foreign = array_filter($liveCounts, static function (int $count, string $line) use ($wantedCounts): bool {
+            return $count > ($wantedCounts[$line] ?? 0);
+        }, ARRAY_FILTER_USE_BOTH);
+        if ($saveCode !== 0 || $foreign !== []) {
+            $report['chains'][] = ['chain' => $c['chain'], 'status' => 'changed', 'detail' => 'A chain with this name has foreign rules; it was not touched.'];
+            continue;
+        }
+        $ok = true;
+        if (! $declared && $run('iptables -w -t nat -N ' . $name)[0] !== 0) {
+            $ok = false;
+        }
+        foreach ($c['rules'] as $i => $storedRule) {
+            $line = $wanted[$i];
+            if (($liveCounts[$line] ?? 0) > 0) {
+                $liveCounts[$line]--;
+                continue;
+            }
+            if ($run(nexovirt_nat_rule_cmd('-A', 'nat', $storedRule['rule']))[0] !== 0) {
+                $ok = false;
+            }
+        }
+        if ($ok && $run(nexovirt_nat_rule_cmd('-C', 'nat', $c['jump']))[0] !== 0 && $run(nexovirt_nat_rule_cmd('-A', 'nat', $c['jump']))[0] !== 0) {
+            $ok = false;
+        }
+        $report['chains'][] = ['chain' => $c['chain'], 'status' => $ok ? ($declared && $live === $wanted ? 'present' : 'restored') : 'failed', 'detail' => ''];
+    }
+    foreach ($v['rules'] as $r) {
+        if ($r['kind'] === 'ipt') {
+            if ($r['count'] === 1) {
+                $present = $run(nexovirt_nat_rule_cmd('-C', $r['table'], $r['rule']))[0] === 0 ? 1 : 0;
+            } else {
+                [, $save] = $run('iptables-save -t ' . escapeshellarg($r['table']));
+                $needle = trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', trim($r['line'])));
+                $present = count(array_filter(preg_split('/\r?\n/', $save) ?: [], static function (string $line) use ($needle): bool {
+                    return trim((string) preg_replace('/^\[\d+:\d+\]\s+/', '', trim($line))) === $needle;
+                }));
+            }
+            $code = 0;
+            $out = '';
+            for ($i = $present; $i < $r['count']; $i++) {
+                [$code, $out] = $run(nexovirt_nat_rule_cmd('-A', $r['table'], $r['rule']));
+                if ($code !== 0) {
+                    break;
+                }
+            }
+            $report['rules'][] = ['line' => $r['line'], 'status' => $code === 0 ? ($present >= $r['count'] ? 'present' : 'restored') : 'failed', 'restored' => max(0, $i - $present), 'detail' => trim($out)];
+            continue;
+        }
+        $where = escapeshellarg($r['family']) . ' ' . escapeshellarg($r['table']) . ' ' . escapeshellarg($r['chain']);
+        [$listCode, $list] = $run('nft -a list chain ' . $where);
+        $present = false;
+        if ($listCode === 0) {
+            foreach (preg_split('/\r?\n/', $list) ?: [] as $line) {
+                if (nexovirt_nat_nft_norm($line) === $r['body']) {
+                    $present = true;
+                    break;
+                }
+            }
+        }
+        if ($present) {
+            $report['rules'][] = ['body' => $r['body'], 'status' => 'present', 'detail' => ''];
+            continue;
+        }
+        $cmd = 'nft ' . escapeshellarg('add rule ' . $r['family'] . ' ' . $r['table'] . ' ' . $r['chain'] . ' ' . $r['body']);
+        [$code, $out] = $run($cmd);
+        $report['rules'][] = ['body' => $r['body'], 'status' => $code === 0 ? 'restored' : 'failed', 'detail' => trim($out)];
+    }
+    foreach ($v['units'] as $u) {
+        [$code, $out] = $run('systemctl enable ' . escapeshellarg($u));
+        $report['units'][] = ['unit' => $u, 'status' => $code === 0 ? 'enabled' : 'failed', 'detail' => $code === 0 ? '' : trim($out)];
+    }
+    $report['after'] = nexovirt_nat_adopt_read_after($run);
+    $flat = array_merge(...array_map(static function (string $k) use ($report): array {
+        return array_column($report[$k], 'status');
+    }, ['files', 'chains', 'rules', 'units']));
+
+    return ['ok' => true, 'result' => $report + ['complete' => ! in_array('failed', $flat, true) && ! in_array('changed', $flat, true) && ! empty($report['after']['ok'])]];
+}
+
+/** DRYRUN runner for the dispatcher: records nothing, every check passes, saves come from the fake env. */
+function nexovirt_nat_adopt_dry_runner(): callable
+{
+    return static function (string $cmd): array {
+        if (strpos($cmd, 'iptables-save') === 0) {
+            return [0, (string) getenv('NEXOVIRT_AGENT_FAKE_IPT_NAT')];
+        }
+        if (strpos($cmd, 'nft -a list') === 0) {
+            return [0, (string) getenv('NEXOVIRT_AGENT_FAKE_NFT')];
+        }
+
+        return [0, strpos($cmd, 'systemctl is-enabled') === 0 ? 'enabled' : ''];
+    };
 }
 
 /**
@@ -1746,6 +2826,19 @@ function nexovirt_apply_nat(array $config): array
     $valid = nexovirt_validate_nat_config($config);
     if (! $valid['ok']) {
         return ['ok' => false, 'error' => $valid['error']];
+    }
+
+    // Never add NexoVirt NAT next to NAT the node already has, unless the admin explicitly allowed it.
+    if (empty($config['allow_foreign'])) {
+        $sets = nexovirt_nat_read_rulesets();
+        if (! $sets['ok']) {
+            return ['ok' => false, 'error' => $sets['error']];
+        }
+        $own     = array_values(array_filter((array) ($config['allowed_dest_cidrs'] ?? []), 'is_string'));
+        $foreign = nexovirt_nat_foreign_rules($sets['ipt'], $sets['nft'], $own);
+        if ($foreign !== []) {
+            return ['ok' => false, 'error' => 'the node already has NAT rules NexoVirt did not create; NAT not changed: ' . implode(' | ', array_slice($foreign, 0, 5))];
+        }
     }
 
     $script = nexovirt_build_nat_script($config);
@@ -2522,7 +3615,7 @@ function nexovirt_read_firewall(): array
         foreach (['iptables', 'nftables', 'ufw', 'firewalld', 'pve-firewall'] as $name) {
             $stub[] = ['name' => $name, 'installed' => true, 'active' => true, 'output' => '(dryrun)'];
         }
-        return ['tools' => $stub];
+        return ['tools' => $stub, 'dhcp' => nexovirt_dhcp_read((string) getenv('NEXOVIRT_AGENT_ETC_ROOT'), nexovirt_node_dry_runner())];
     }
 
     $tools = [];
@@ -2600,7 +3693,8 @@ function nexovirt_read_firewall(): array
     }
     $tools[] = ['name' => 'pve-firewall', 'installed' => $pveInstalled, 'active' => $active, 'output' => $out];
 
-    return ['tools' => $tools];
+    // DHCP pools + UDP 67 listeners (read-only): IP zone overlap warnings and the NAT DHCP conflict view.
+    return ['tools' => $tools, 'dhcp' => nexovirt_dhcp_read('', nexovirt_node_runner())];
 }
 
 // ---------------------------------------------------------------------------
@@ -3327,6 +4421,1422 @@ function nexovirt_apt_upgrade_status(int $offset): array
     ];
 }
 
+// ---------------------------------------------------------------------------
+// DHCP on NAT networks (apply_dhcp) + DHCP pool discovery (read_firewall `dhcp`) + the fail2ban jail
+// for the Proxmox web UI (apply_fail2ban, read_fail2ban, fail2ban_unban). Agent 0.25.0, fail2ban fixes 0.25.1.
+//
+// SAFETY CONTRACT: NexoVirt's dnsmasq instances use ONLY their own files (/etc/nexovirt-dhcp/<bridge>.conf
+// loaded with -C, so /etc/dnsmasq.conf and /etc/dnsmasq.d are never read or written), their own unit
+// template, lease and pid files. A bridge where another DHCP server already listens or is configured is
+// refused. The fail2ban jail writes ONLY its two nexovirt-pve.conf files and never starts an admin's
+// stopped fail2ban. Every payload field is validated fail-closed before anything is touched; every
+// interpolated value is escapeshellarg'd. All paths take a $root prefix (the DRYRUN test seam).
+// ---------------------------------------------------------------------------
+
+const DHCP_DIR              = '/etc/nexovirt-dhcp';
+const DHCP_LEASE_DIR        = '/var/lib/nexovirt-dhcp';
+const DHCP_UNIT_PATH        = '/etc/systemd/system/nexovirt-dhcp@.service';
+const DHCP_MAX_INSTANCES    = 16;
+const DHCP_MAX_RESERVATIONS = 1024;
+const DHCP_LEASE_TIME       = '12h';
+const F2B_JAIL              = 'nexovirt-pve';
+const F2B_JAIL_PATH         = '/etc/fail2ban/jail.d/nexovirt-pve.conf';
+const F2B_FILTER_PATH       = '/etc/fail2ban/filter.d/nexovirt-pve.conf';
+const F2B_MAX_IGNORE        = 32;
+const F2B_ACCESS_LOG        = '/var/log/pveproxy/access.log';
+
+/** Real command runner: [exit code, combined output]. apt-get runs with busy heartbeats ($tick) so the agent never looks stale. */
+function nexovirt_node_runner(?callable $tick = null): callable
+{
+    return static function (string $cmd) use ($tick): array {
+        if ($tick !== null && str_contains($cmd, 'apt-get')) {
+            $r = nexovirt_run_with_ticks($cmd . ' 2>&1', $tick, 20);
+
+            return [$r['code'], $r['out']];
+        }
+
+        return nexovirt_nat_adopt_exec($cmd);
+    };
+}
+
+/**
+ * DRYRUN runner: never executes anything. Outputs come from NEXOVIRT_AGENT_FAKE_CMDS, a JSON object of
+ * command prefix => [code, output]; anything else answers [0, ''].
+ */
+function nexovirt_node_dry_runner(): callable
+{
+    $fakes = json_decode((string) getenv('NEXOVIRT_AGENT_FAKE_CMDS'), true);
+    $fakes = is_array($fakes) ? $fakes : [];
+
+    return static function (string $cmd) use ($fakes): array {
+        foreach ($fakes as $prefix => $answer) {
+            if (strpos($cmd, (string) $prefix) === 0 && is_array($answer)) {
+                return [(int) ($answer[0] ?? 0), (string) ($answer[1] ?? '')];
+            }
+        }
+
+        return [0, ''];
+    };
+}
+
+/** [root, runner] for a job: the real node, or the DRYRUN seam. */
+function nexovirt_node_ctx(array $config = []): array
+{
+    $tick = isset($config['busyTick']) && is_callable($config['busyTick']) ? $config['busyTick'] : null;
+
+    return getenv('NEXOVIRT_AGENT_DRYRUN') === '1'
+        ? [(string) getenv('NEXOVIRT_AGENT_ETC_ROOT'), nexovirt_node_dry_runner()]
+        : ['', nexovirt_node_runner($tick)];
+}
+
+/** IPv4 dotted quad -> unsigned int, or null. PURE. */
+function nexovirt_ip4_long(string $ip): ?int
+{
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+        return null;
+    }
+
+    return ip2long($ip) & 0xFFFFFFFF;
+}
+
+/** [network, broadcast, netmask] of a valid IPv4 CIDR. PURE. @return array{0:int,1:int,2:string} */
+function nexovirt_dhcp_net(string $cidr): array
+{
+    [$net, $bits] = explode('/', $cidr, 2);
+    $prefix = (int) $bits;
+    $mask   = $prefix === 0 ? 0 : ((0xFFFFFFFF << (32 - $prefix)) & 0xFFFFFFFF);
+    $first  = (ip2long($net) & 0xFFFFFFFF) & $mask;
+
+    return [$first, $first | (~$mask & 0xFFFFFFFF), long2ip($mask)];
+}
+
+/** Bridge name for a NexoVirt DHCP instance (also a systemd instance name): starts alphanumeric. PURE. */
+function nexovirt_dhcp_valid_bridge(string $b): bool
+{
+    return nexovirt_validate_iface($b) && ctype_alnum($b[0]);
+}
+
+/**
+ * Validate an apply_dhcp payload (fail-closed: one bad field refuses the whole job). PURE.
+ *
+ * @return array{ok:bool,error:string,instances:list<array<string,mixed>>}
+ */
+function nexovirt_dhcp_validate(array $p): array
+{
+    $bad  = static fn (string $e): array => ['ok' => false, 'error' => $e, 'instances' => []];
+    $list = $p['instances'] ?? null;
+    if (! is_array($list) || array_values($list) !== $list || count($list) > DHCP_MAX_INSTANCES) {
+        return $bad('instances must be a list of at most ' . DHCP_MAX_INSTANCES);
+    }
+    $out     = [];
+    $bridges = [];
+    foreach ($list as $i => $in) {
+        if (! is_array($in)) {
+            return $bad("instance {$i}: not an object");
+        }
+        $bridge = (string) ($in['bridge'] ?? '');
+        $cidr   = (string) ($in['cidr'] ?? '');
+        if (! nexovirt_dhcp_valid_bridge($bridge) || isset($bridges[$bridge])) {
+            return $bad("instance {$i}: invalid or duplicate bridge");
+        }
+        $bridges[$bridge] = true;
+        if (! nexovirt_validate_nat_cidr($cidr) || (int) explode('/', $cidr)[1] < 16 || (int) explode('/', $cidr)[1] > 30) {
+            return $bad("instance {$i}: cidr must be a private /16../30");
+        }
+        [$net, $bcast, $mask] = nexovirt_dhcp_net($cidr);
+        $usable = static function ($ip) use ($net, $bcast): ?int {
+            $l = is_string($ip) ? nexovirt_ip4_long($ip) : null;
+
+            return $l !== null && $l > $net && $l < $bcast ? $l : null;
+        };
+        $gw    = $usable($in['gateway'] ?? null);
+        $start = $usable($in['range_start'] ?? null);
+        $end   = $usable($in['range_end'] ?? null);
+        if ($gw === null || $start === null || $end === null || $start > $end || ($gw >= $start && $gw <= $end)) {
+            return $bad("instance {$i}: gateway and range must be usable addresses of {$cidr}, gateway outside the range");
+        }
+        $dns = $in['dns'] ?? [];
+        if (! is_array($dns) || count($dns) > 3) {
+            return $bad("instance {$i}: at most 3 dns servers");
+        }
+        foreach ($dns as $d) {
+            if (! is_string($d) || nexovirt_ip4_long($d) === null) {
+                return $bad("instance {$i}: invalid dns server");
+            }
+        }
+        $res = $in['reservations'] ?? [];
+        if (! is_array($res) || count($res) > DHCP_MAX_RESERVATIONS) {
+            return $bad("instance {$i}: too many reservations");
+        }
+        $seen = [];
+        $norm = [];
+        foreach ($res as $r) {
+            $vmid = is_array($r) ? (is_int($r['vmid'] ?? null) ? (string) $r['vmid'] : (string) ($r['vmid'] ?? '')) : '';
+            $ip   = is_array($r) ? $usable($r['ip'] ?? null) : null;
+            $type = is_array($r) ? (string) ($r['type'] ?? '') : '';
+            if (! in_array($type, ['qemu', 'lxc'], true) || preg_match('/^[1-9][0-9]{2,8}$/', $vmid) !== 1 || $ip === null || $ip === $gw || isset($seen[$ip])) {
+                return $bad("instance {$i}: invalid reservation");
+            }
+            $seen[$ip] = true;
+            $norm[]    = ['type' => $type, 'vmid' => $vmid, 'ip' => long2ip($ip)];
+        }
+        $out[] = [
+            'bridge' => $bridge, 'cidr' => $cidr, 'netmask' => $mask, 'gateway' => long2ip($gw),
+            'range_start' => long2ip($start), 'range_end' => long2ip($end), 'dns' => array_values($dns), 'reservations' => $norm,
+        ];
+    }
+
+    return ['ok' => true, 'error' => '', 'instances' => $out];
+}
+
+/** MAC of a guest NIC on $bridge from its PVE config (current section only), uppercase, or ''. */
+function nexovirt_dhcp_guest_mac(string $root, string $type, string $vmid, string $bridge): string
+{
+    $dir  = $type === 'lxc' ? '/etc/pve/lxc/' : '/etc/pve/qemu-server/';
+    $conf = @file_get_contents($root . $dir . $vmid . '.conf');
+    if (! is_string($conf)) {
+        return '';
+    }
+    $current = preg_split('/^\[/m', $conf)[0];
+    foreach (preg_split('/\R/', $current) as $line) {
+        if (preg_match('/^net\d+:\s*(\S+)/', $line, $m) !== 1) {
+            continue;
+        }
+        $mac = '';
+        $br  = '';
+        foreach (explode(',', $m[1]) as $kv) {
+            [$k, $v] = array_pad(explode('=', $kv, 2), 2, '');
+            if ($k === 'bridge') {
+                $br = $v;
+            } elseif (preg_match('/^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/', $v) === 1) {
+                $mac = strtoupper($v);
+            }
+        }
+        if ($br === $bridge && $mac !== '') {
+            return $mac;
+        }
+    }
+
+    return '';
+}
+
+/** dnsmasq config of one instance. $macs = ip => MAC. PURE. */
+function nexovirt_dhcp_conf(array $inst, array $macs): string
+{
+    $lines = [
+        '# Managed by nexovirt-agent: rewritten on every apply. Not read by the system dnsmasq.',
+        'port=0',
+        'interface=' . $inst['bridge'],
+        'except-interface=lo',
+        'bind-interfaces',
+        'no-resolv',
+        'no-hosts',
+        'dhcp-range=' . $inst['range_start'] . ',' . $inst['range_end'] . ',' . $inst['netmask'] . ',' . DHCP_LEASE_TIME,
+        'dhcp-option=option:router,' . $inst['gateway'],
+        'dhcp-leasefile=' . DHCP_LEASE_DIR . '/' . $inst['bridge'] . '.leases',
+    ];
+    if ($inst['dns'] !== []) {
+        $lines[] = 'dhcp-option=option:dns-server,' . implode(',', $inst['dns']);
+    }
+    foreach ($macs as $ip => $mac) {
+        $lines[] = 'dhcp-host=' . $mac . ',' . $ip;
+    }
+
+    return implode("\n", $lines) . "\n";
+}
+
+/** systemd template unit for the instances. PURE. */
+function nexovirt_dhcp_unit(string $bin): string
+{
+    return "[Unit]\nDescription=NexoVirt DHCP on %i (dnsmasq, own config)\nAfter=network-online.target\nWants=network-online.target\n\n"
+        . "[Service]\nType=simple\nExecStart={$bin} --keep-in-foreground --conf-file=" . DHCP_DIR . "/%i.conf --pid-file=/run/nexovirt-dhcp-%i.pid\n"
+        . "Restart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
+}
+
+/** Strip a config comment (#, ;) and trim. PURE. */
+function nexovirt_dhcp_strip(string $line): string
+{
+    return trim((string) preg_replace('/\s*[#;].*$/', '', $line));
+}
+
+/**
+ * dhcp-range pools of dnsmasq config files ($files = path => content). The interface comes from an explicit
+ * `interface:` token, else the `interface=` lines of the same file, of its directory, or of the main file
+ * (dnsmasq.conf); none = '' (every interface). IPv4 ranges only. PURE.
+ *
+ * @return list<array{source:string,file:string,interface:string,start:string,end:string}>
+ */
+function nexovirt_dhcp_parse_dnsmasq(array $files, string $source = 'dnsmasq'): array
+{
+    $ifByFile = [];
+    $ifByDir  = [];
+    $mainIf   = [];
+    foreach ($files as $path => $content) {
+        foreach (preg_split('/\R/', (string) $content) as $line) {
+            $l = nexovirt_dhcp_strip($line);
+            if (preg_match('/^interface\s*=\s*(.+)$/', $l, $m) === 1) {
+                foreach (array_filter(array_map('trim', explode(',', $m[1]))) as $if) {
+                    $ifByFile[$path][]           = $if;
+                    $ifByDir[dirname($path)][]   = $if;
+                    if (basename($path) === 'dnsmasq.conf') {
+                        $mainIf[] = $if;
+                    }
+                }
+            }
+        }
+    }
+    $pools = [];
+    foreach ($files as $path => $content) {
+        foreach (preg_split('/\R/', (string) $content) as $line) {
+            $l = nexovirt_dhcp_strip($line);
+            if (preg_match('/^dhcp-range\s*=\s*(.+)$/', $l, $m) !== 1) {
+                continue;
+            }
+            $explicit = [];
+            $addr     = [];
+            foreach (array_map('trim', explode(',', $m[1])) as $tok) {
+                if (str_starts_with($tok, 'interface:')) {
+                    $explicit[] = substr($tok, 10);
+                } elseif (! str_starts_with($tok, 'tag:') && ! str_starts_with($tok, 'set:')) {
+                    $addr[] = $tok;
+                }
+            }
+            if (count($addr) < 2 || nexovirt_ip4_long($addr[0]) === null || nexovirt_ip4_long($addr[1]) === null) {
+                continue; // static / proxy / IPv6 ranges hand out no IPv4 pool
+            }
+            // A per-zone sub directory (PVE SDN dnsmasq@<zone>) is its own instance: no fallback to dnsmasq.conf.
+            $main = in_array(dirname($path), ['/etc', '/etc/dnsmasq.d'], true) ? $mainIf : [];
+            $ifs  = $explicit ?: ($ifByFile[$path] ?? ($ifByDir[dirname($path)] ?? $main)) ?: [''];
+            foreach (array_unique($ifs) as $if) {
+                $pools[] = ['source' => $source, 'file' => (string) $path, 'interface' => $if, 'start' => $addr[0], 'end' => $addr[1]];
+            }
+        }
+    }
+
+    return $pools;
+}
+
+/** isc-dhcp-server `range a b;` pools; interface from INTERFACESv4 when it names exactly one. PURE. */
+function nexovirt_dhcp_parse_isc(string $conf, string $defaults, string $file = '/etc/dhcp/dhcpd.conf'): array
+{
+    $if = '';
+    if (preg_match('/^\s*INTERFACESv4\s*=\s*"?([^"\n]*)"?/m', $defaults, $m) === 1) {
+        $names = preg_split('/\s+/', trim($m[1])) ?: [];
+        $if    = count($names) === 1 ? $names[0] : '';
+    }
+    $text = (string) preg_replace('/#.*$/m', '', $conf);
+    preg_match_all('/\brange\s+(?:dynamic-bootp\s+)?(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s*;/', $text, $mm, PREG_SET_ORDER);
+    $pools = [];
+    foreach ($mm as $r) {
+        $pools[] = ['source' => 'isc-dhcp-server', 'file' => $file, 'interface' => $if, 'start' => $r[1], 'end' => $r[2]];
+    }
+
+    return $pools;
+}
+
+/** Kea DHCPv4 pools ("a - b") when the file decodes as JSON once comment lines are dropped. PURE. */
+function nexovirt_dhcp_parse_kea(string $json, string $file = '/etc/kea/kea-dhcp4.conf'): array
+{
+    $clean = implode("\n", array_filter(preg_split('/\R/', $json), static fn ($l) => ! preg_match('/^\s*(#|\/\/)/', $l)));
+    $doc   = json_decode($clean, true);
+    $d4    = is_array($doc) ? ($doc['Dhcp4'] ?? null) : null;
+    if (! is_array($d4)) {
+        return [];
+    }
+    $ifs = array_values(array_unique(array_map(static fn ($i) => explode('/', (string) $i)[0], (array) ($d4['interfaces-config']['interfaces'] ?? []))));
+    $if  = count($ifs) === 1 && $ifs[0] !== '*' ? $ifs[0] : '';
+    $pools = [];
+    foreach ((array) ($d4['subnet4'] ?? []) as $subnet) {
+        foreach ((array) ($subnet['pools'] ?? []) as $pool) {
+            if (preg_match('/^\s*(\d+\.\d+\.\d+\.\d+)\s*-\s*(\d+\.\d+\.\d+\.\d+)\s*$/', (string) ($pool['pool'] ?? ''), $m) === 1) {
+                $pools[] = ['source' => 'kea', 'file' => $file, 'interface' => $if, 'start' => $m[1], 'end' => $m[2]];
+            }
+        }
+    }
+
+    return $pools;
+}
+
+/**
+ * UDP 67 sockets from `ss -H -lunp`: interface after '%' (bind-interfaces), else '' = every interface. PURE.
+ *
+ * @return list<array{interface:string,process:string,pid:int}>
+ */
+function nexovirt_dhcp_parse_listeners(string $ss): array
+{
+    $out = [];
+    foreach (preg_split('/\R/', $ss) as $line) {
+        if (preg_match('/\s(\S+):67\s/', $line . ' ', $m) !== 1) {
+            continue;
+        }
+        $if = str_contains($m[1], '%') ? substr($m[1], strpos($m[1], '%') + 1) : '';
+        preg_match('/users:\(\("([^"]+)",pid=(\d+)/', $line, $p);
+        $out[] = ['interface' => $if, 'process' => (string) ($p[1] ?? 'unknown'), 'pid' => (int) ($p[2] ?? 0)];
+    }
+
+    return $out;
+}
+
+/** Readable regular config files under a directory (one level, plus one more for PVE SDN's per-zone dirs). */
+function nexovirt_dhcp_conf_files(string $dir, bool $nested): array
+{
+    $paths = glob($dir . '/*') ?: [];
+    if ($nested) {
+        $paths = array_merge($paths, glob($dir . '/*/*') ?: []);
+    }
+    $out = [];
+    foreach ($paths as $p) {
+        $b = basename($p);
+        if (is_file($p) && is_readable($p) && $b[0] !== '.' && ! str_ends_with($b, '~') && preg_match('/\.(dpkg-[a-z]+|bak|orig)$/', $b) !== 1) {
+            $out[$p] = (string) @file_get_contents($p, false, null, 0, 262144);
+        }
+    }
+
+    return $out;
+}
+
+/** Bridges with a NexoVirt DHCP instance (from the own config files). @return list<string> */
+function nexovirt_dhcp_own_bridges(string $root): array
+{
+    return array_values(array_filter(array_map(static fn ($p) => basename($p, '.conf'), glob($root . DHCP_DIR . '/*.conf') ?: []), 'nexovirt_dhcp_valid_bridge'));
+}
+
+/**
+ * Read-only DHCP picture of the node: every IPv4 pool (hand-made dnsmasq / isc-dhcp-server / kea, and
+ * NexoVirt's own instances) and every UDP 67 listener (`own` when it is one of our pids).
+ *
+ * @return array{pools:list<array<string,string>>,listeners:list<array<string,mixed>>}
+ */
+function nexovirt_dhcp_read(string $root, callable $run): array
+{
+    $strip = static function (array $files) use ($root): array {
+        $o = [];
+        foreach ($files as $p => $c) {
+            $o[substr($p, strlen($root))] = $c;
+        }
+
+        return $o;
+    };
+    $dnsmasq = $strip(nexovirt_dhcp_conf_files($root . '/etc/dnsmasq.d', true));
+    if (is_readable($root . '/etc/dnsmasq.conf')) {
+        $dnsmasq['/etc/dnsmasq.conf'] = (string) @file_get_contents($root . '/etc/dnsmasq.conf', false, null, 0, 262144);
+    }
+    $pools = array_merge(
+        nexovirt_dhcp_parse_dnsmasq($dnsmasq),
+        nexovirt_dhcp_parse_dnsmasq($strip(nexovirt_dhcp_conf_files($root . DHCP_DIR, false)), 'nexovirt'),
+        nexovirt_dhcp_parse_isc((string) @file_get_contents($root . '/etc/dhcp/dhcpd.conf'), (string) @file_get_contents($root . '/etc/default/isc-dhcp-server')),
+        nexovirt_dhcp_parse_kea((string) @file_get_contents($root . '/etc/kea/kea-dhcp4.conf'))
+    );
+    $ownPids = [];
+    foreach (nexovirt_dhcp_own_bridges($root) as $b) {
+        $pid = (int) trim((string) @file_get_contents($root . '/run/nexovirt-dhcp-' . $b . '.pid'));
+        if ($pid > 0) {
+            $ownPids[$pid] = true;
+        }
+    }
+    [, $ss]    = $run("ss -H -lunp 'sport = :67'");
+    $listeners = array_map(static fn ($l) => $l + ['own' => isset($ownPids[$l['pid']])], nexovirt_dhcp_parse_listeners((string) $ss));
+
+    return ['pools' => $pools, 'listeners' => $listeners];
+}
+
+/** Why a new NexoVirt DHCP instance on $bridge would clash with a DHCP server it did not create. PURE. @return list<string> */
+function nexovirt_dhcp_conflicts(string $bridge, array $read): array
+{
+    $why = [];
+    foreach ($read['listeners'] as $l) {
+        if (! $l['own'] && ($l['interface'] === $bridge || $l['interface'] === '')) {
+            $why[] = $l['process'] . ' (pid ' . $l['pid'] . ') already answers DHCP on ' . ($l['interface'] === '' ? 'every interface' : $bridge);
+        }
+    }
+    foreach ($read['pools'] as $p) {
+        if ($p['source'] !== 'nexovirt' && $p['interface'] === $bridge) {
+            $why[] = $p['source'] . ' config ' . $p['file'] . ' hands out ' . $p['start'] . '-' . $p['end'] . ' on ' . $bridge;
+        }
+    }
+
+    return $why;
+}
+
+/** Commands that remove every NexoVirt DHCP instance (agent removal, mirrored by the panel). PURE. @return list<string> */
+function nexovirt_dhcp_clear_cmds(): array
+{
+    return [
+        'for f in ' . DHCP_DIR . '/*.conf; do [ -e "$f" ] && systemctl disable --now "nexovirt-dhcp@$(basename "$f" .conf).service" >/dev/null 2>&1; done; true',
+        'rm -rf ' . DHCP_DIR . ' ' . DHCP_LEASE_DIR,
+        'rm -f ' . DHCP_UNIT_PATH . ' /run/nexovirt-dhcp-*.pid',
+    ];
+}
+
+/** Ensure a dnsmasq binary (installs dnsmasq-base: no service, no config). Returns the path or ''. */
+function nexovirt_dhcp_ensure_bin(callable $run): string
+{
+    [$code, $out] = $run('command -v dnsmasq');
+    if ($code === 0 && trim($out) !== '') {
+        return trim($out);
+    }
+    $install = 'DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y dnsmasq-base';
+    if ($run($install)[0] !== 0) {
+        $run('DEBIAN_FRONTEND=noninteractive timeout 150 apt-get update');
+        $run($install);
+    }
+    [$code, $out] = $run('command -v dnsmasq');
+
+    return $code === 0 ? trim($out) : '';
+}
+
+/**
+ * Reconcile NexoVirt's DHCP instances to the payload's full desired set.
+ *
+ * @return array{ok:bool,result:string}
+ */
+function nexovirt_apply_dhcp(array $p, string $root, callable $run): array
+{
+    $v = nexovirt_dhcp_validate($p);
+    if (! $v['ok']) {
+        return ['ok' => false, 'result' => 'invalid apply_dhcp payload: ' . $v['error']];
+    }
+    $own  = nexovirt_dhcp_own_bridges($root);
+    $read = nexovirt_dhcp_read($root, $run);
+
+    // Refuse before touching anything: a foreign DHCP server on a new bridge, or a bridge without an address in the CIDR.
+    foreach ($v['instances'] as $inst) {
+        $b = $inst['bridge'];
+        if (! in_array($b, $own, true)) {
+            $why = nexovirt_dhcp_conflicts($b, $read);
+            if ($why !== []) {
+                return ['ok' => false, 'result' => 'another DHCP server is already active on ' . $b . '; nothing changed: ' . implode(' | ', $why)];
+            }
+        }
+        [, $addr] = $run('ip -4 -o addr show dev ' . escapeshellarg($b));
+        preg_match_all('/\binet (\d+\.\d+\.\d+\.\d+)\//', (string) $addr, $m);
+        if (array_filter($m[1], static fn ($ip) => nexovirt_nat_ip_in_cidr($ip, $inst['cidr'])) === []) {
+            return ['ok' => false, 'result' => 'bridge ' . $b . ' has no address in ' . $inst['cidr'] . '; nothing changed'];
+        }
+    }
+
+    $bin = '';
+    if ($v['instances'] !== []) {
+        $bin = nexovirt_dhcp_ensure_bin($run);
+        if ($bin === '' || $bin[0] !== '/') {
+            return ['ok' => false, 'result' => 'dnsmasq is not installed and dnsmasq-base could not be installed; nothing changed'];
+        }
+        @mkdir($root . DHCP_DIR, 0755, true);
+        @mkdir($root . DHCP_LEASE_DIR, 0755, true);
+        @mkdir(dirname($root . DHCP_UNIT_PATH), 0755, true);
+        if (@file_put_contents($root . DHCP_UNIT_PATH, nexovirt_dhcp_unit($bin)) === false) {
+            return ['ok' => false, 'result' => 'cannot write the DHCP unit'];
+        }
+    }
+
+    $want    = array_column($v['instances'], 'bridge');
+    $removed = [];
+    foreach (array_diff($own, $want) as $b) {
+        $run('systemctl disable --now ' . escapeshellarg('nexovirt-dhcp@' . $b . '.service'));
+        @unlink($root . DHCP_DIR . '/' . $b . '.conf');
+        @unlink($root . DHCP_LEASE_DIR . '/' . $b . '.leases');
+        $removed[] = $b;
+    }
+    $run('systemctl daemon-reload');
+
+    $states = [];
+    $ok     = true;
+    foreach ($v['instances'] as $inst) {
+        $macs    = [];
+        $skipped = [];
+        foreach ($inst['reservations'] as $r) {
+            $mac = nexovirt_dhcp_guest_mac($root, $r['type'], $r['vmid'], $inst['bridge']);
+            if ($mac !== '') {
+                $macs[$r['ip']] = $mac;
+            } else {
+                $skipped[] = $r['vmid'];
+            }
+        }
+        $unit  = escapeshellarg('nexovirt-dhcp@' . $inst['bridge'] . '.service');
+        $wrote = @file_put_contents($root . DHCP_DIR . '/' . $inst['bridge'] . '.conf', nexovirt_dhcp_conf($inst, $macs)) !== false;
+        $err   = '';
+        if (! $wrote) {
+            $err = 'cannot write the config';
+        } else {
+            $run('systemctl enable ' . $unit);
+            [$code, $out] = $run('systemctl restart ' . $unit);
+            [, $active]   = $run('systemctl is-active ' . $unit);
+            if ($code !== 0 || trim($active) !== 'active') {
+                [, $log] = $run('journalctl -u ' . $unit . ' -n 5 --no-pager');
+                $err     = trim($out . "\n" . $log) ?: 'the DHCP service did not start';
+            }
+        }
+        $ok       = $ok && $err === '';
+        $states[] = ['bridge' => $inst['bridge'], 'state' => $err === '' ? 'active' : 'failed', 'error' => nexovirt_cap_output($err, 2000), 'reserved' => count($macs), 'skipped' => $skipped];
+    }
+    if ($v['instances'] === []) {
+        @unlink($root . DHCP_UNIT_PATH);
+        $run('systemctl daemon-reload');
+    }
+
+    return ['ok' => $ok, 'result' => nexovirt_json(['instances' => $states, 'removed' => $removed])];
+}
+
+/** An IP or CIDR (v4 prefix >= 8, v6 prefix >= 16, so "ignore everyone" is impossible). PURE. */
+function nexovirt_f2b_valid_addr(string $a): bool
+{
+    [$ip, $bits] = array_pad(explode('/', $a, 2), 2, null);
+    if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
+        return false;
+    }
+    if ($bits === null) {
+        return true;
+    }
+    $v6 = str_contains($ip, ':');
+
+    return ctype_digit($bits) && (int) $bits >= ($v6 ? 16 : 8) && (int) $bits <= ($v6 ? 128 : 32);
+}
+
+/** Validate an apply_fail2ban payload. PURE. @return array{ok:bool,error:string,cfg:array<string,mixed>} */
+function nexovirt_f2b_validate(array $p): array
+{
+    $bad = static fn (string $e): array => ['ok' => false, 'error' => $e, 'cfg' => []];
+    $int = static fn ($v, int $min, int $max): ?int => (is_int($v) || (is_string($v) && ctype_digit($v))) && (int) $v >= $min && (int) $v <= $max ? (int) $v : null;
+    if (empty($p['enabled'])) {
+        return ['ok' => true, 'error' => '', 'cfg' => ['enabled' => false]];
+    }
+    $ban   = $int($p['bantime'] ?? null, 60, 2592000);
+    $find  = $int($p['findtime'] ?? null, 60, 86400);
+    $retry = $int($p['maxretry'] ?? null, 1, 100);
+    if ($ban === null || $find === null || $retry === null) {
+        return $bad('bantime 60..2592000, findtime 60..86400, maxretry 1..100');
+    }
+    $panel = (string) ($p['panel_ip'] ?? '');
+    if (filter_var($panel, FILTER_VALIDATE_IP) === false) {
+        return $bad('panel_ip must be the panel\'s address (it is never banned)');
+    }
+    $user = $p['pve_user'] ?? '';
+    if (! is_string($user) || ($user !== '' && ! nexovirt_f2b_valid_user($user))) {
+        return $bad('pve_user must be a Proxmox user id');
+    }
+    $ignore = $p['ignore'] ?? [];
+    if (! is_array($ignore) || count($ignore) > F2B_MAX_IGNORE) {
+        return $bad('ignore must be a list of at most ' . F2B_MAX_IGNORE);
+    }
+    foreach ($ignore as $a) {
+        if (! is_string($a) || ! nexovirt_f2b_valid_addr($a)) {
+            return $bad('invalid ignore entry');
+        }
+    }
+
+    return ['ok' => true, 'error' => '', 'cfg' => ['enabled' => true, 'bantime' => $ban, 'findtime' => $find, 'maxretry' => $retry,
+        'ignore' => array_values(array_unique(array_merge(['127.0.0.1/8', '::1', $panel], $ignore)))]];
+}
+
+/** The filter: pvedaemon's failed web UI / API logins. PURE. */
+function nexovirt_f2b_filter(): string
+{
+    return "# Managed by nexovirt-agent.\n[Definition]\n"
+        . "failregex = pvedaemon\\[.*authentication (verification )?failure; rhost=(::ffff:)?<HOST> user=.* msg=.*\n"
+        . "ignoreregex =\n";
+}
+
+/** The jail for the Proxmox web UI (port 8006). PURE. */
+function nexovirt_f2b_jail(array $cfg): string
+{
+    return "# Managed by nexovirt-agent.\n[" . F2B_JAIL . "]\nenabled = true\nport = 8006\nfilter = " . F2B_JAIL . "\n"
+        . "backend = systemd\njournalmatch = _SYSTEMD_UNIT=pvedaemon.service\n"
+        . 'maxretry = ' . $cfg['maxretry'] . "\nfindtime = " . $cfg['findtime'] . "\nbantime = " . $cfg['bantime'] . "\n"
+        . 'ignoreip = ' . implode(' ', $cfg['ignore']) . "\n";
+}
+
+/** Commands that remove the NexoVirt jail (agent removal, mirrored by the panel). PURE. @return list<string> */
+function nexovirt_f2b_clear_cmds(): array
+{
+    return [
+        'if [ -f ' . F2B_JAIL_PATH . ' ]; then fail2ban-client stop ' . F2B_JAIL . ' >/dev/null 2>&1; fi; true',
+        'rm -f ' . F2B_JAIL_PATH . ' ' . F2B_FILTER_PATH,
+    ];
+}
+
+/** A Proxmox user id (user@realm, optionally !tokenid) as pveproxy logs it. PURE. */
+function nexovirt_f2b_valid_user(string $u): bool
+{
+    return preg_match('/^[A-Za-z0-9._-]{1,64}@[A-Za-z0-9._-]{1,64}(![A-Za-z0-9._-]{1,64})?$/', $u) === 1;
+}
+
+/**
+ * Client addresses of the panel's AUTHENTICATED API calls in pveproxy's access.log (lines
+ * `<ip> - <user> [..] "<METHOD> <path> ..." <status>`): only 2xx answers, never the login itself
+ * (POST /api2/json/access/ticket), so a failed or attempted login with the panel's user name never lands
+ * here. Most recent first, with counts. SUGGESTIONS ONLY: never added to ignoreip. PURE.
+ * @return list<array{ip:string,count:int}>
+ */
+function nexovirt_f2b_panel_addrs(string $log, string $user): array
+{
+    $seen = [];
+    foreach (array_reverse(preg_split('/\R/', $log) ?: []) as $line) {
+        if (preg_match('/^(\S+) - (\S+) \[[^\]]*\] "(\S+) (\S+)[^"]*" (\d{3})\b/', $line, $m) !== 1 || $m[2] !== $user
+            || $m[5][0] !== '2' || ($m[3] === 'POST' && str_starts_with($m[4], '/api2/json/access/ticket'))) {
+            continue;
+        }
+        $ip = (string) preg_replace('/^::ffff:(?=\d+\.)/', '', $m[1]);
+        if (filter_var($ip, FILTER_VALIDATE_IP) !== false) {
+            $seen[$ip] = ($seen[$ip] ?? 0) + 1;
+        }
+    }
+    $out = [];
+    foreach (array_slice($seen, 0, 20, true) as $ip => $n) {
+        $out[] = ['ip' => (string) $ip, 'count' => $n];
+    }
+
+    return $out;
+}
+
+/** The panel's addresses as the node sees them (last 2000 lines of pveproxy's access.log). */
+function nexovirt_f2b_read_panel_addrs(string $root, string $user, callable $run): array
+{
+    if (! nexovirt_f2b_valid_user($user)) {
+        return [];
+    }
+    [$code, $log] = $run('tail -n 2000 ' . escapeshellarg($root . F2B_ACCESS_LOG));
+
+    return $code === 0 ? nexovirt_f2b_panel_addrs((string) $log, $user) : [];
+}
+
+/**
+ * Hand-made jails that already watch the Proxmox web UI: a section in jail.local / jail.d/*.conf|*.local
+ * (never NexoVirt's own file) whose body or filter mentions pvedaemon or port 8006. Only enabled ones.
+ * @return list<array{name:string,file:string}>
+ */
+function nexovirt_f2b_foreign_jails(string $root): array
+{
+    $files = array_merge([$root . '/etc/fail2ban/jail.local'], glob($root . '/etc/fail2ban/jail.d/*.conf') ?: [], glob($root . '/etc/fail2ban/jail.d/*.local') ?: []);
+    $found = [];
+    foreach ($files as $f) {
+        if (! is_file($f) || $f === $root . F2B_JAIL_PATH) {
+            continue;
+        }
+        $section = null;
+        $bodies  = [];
+        foreach (preg_split('/\R/', (string) @file_get_contents($f)) ?: [] as $line) {
+            $t = trim($line);
+            if ($t === '' || $t[0] === '#' || $t[0] === ';') {
+                continue;
+            }
+            if (preg_match('/^\[([^\]]+)\]$/', $t, $m) === 1) {
+                $section = trim($m[1]);
+                $bodies[$section] = $bodies[$section] ?? '';
+                continue;
+            }
+            if ($section !== null) {
+                $bodies[$section] .= $t . "\n";
+            }
+        }
+        foreach ($bodies as $name => $body) {
+            if ($name === 'DEFAULT' || $name === 'INCLUDES' || $name === F2B_JAIL
+                || preg_match('/^enabled\s*=\s*(true|yes|1|on)\s*$/mi', $body) !== 1) {
+                continue;
+            }
+            $hit = preg_match('/pvedaemon|\b8006\b/', $body) === 1;
+            if (! $hit && preg_match('/^filter\s*=\s*([A-Za-z0-9._-]+)/mi', $body, $fm) === 1) {
+                foreach (['.conf', '.local'] as $ext) {
+                    $hit = $hit || str_contains((string) @file_get_contents($root . '/etc/fail2ban/filter.d/' . $fm[1] . $ext), 'pvedaemon');
+                }
+            }
+            if ($hit) {
+                $found[] = ['name' => (string) $name, 'file' => substr($f, strlen($root))];
+            }
+        }
+    }
+
+    return $found;
+}
+
+/** Restore our two files to what they were before (null = remove). */
+function nexovirt_f2b_restore(string $root, ?string $jail, ?string $filter): void
+{
+    foreach ([F2B_JAIL_PATH => $jail, F2B_FILTER_PATH => $filter] as $path => $old) {
+        $old === null ? @unlink($root . $path) : @file_put_contents($root . $path, $old);
+    }
+}
+
+/** Remove the jail: delete our files, full reload (drops jails no longer configured), verify it is gone. */
+function nexovirt_f2b_disable(string $root, bool $haveClient, callable $run): array
+{
+    @unlink($root . F2B_JAIL_PATH);
+    @unlink($root . F2B_FILTER_PATH);
+    if ($haveClient && $run('fail2ban-client status ' . F2B_JAIL)[0] === 0) {
+        $run('fail2ban-client reload');
+        if ($run('fail2ban-client status ' . F2B_JAIL)[0] === 0) {
+            $run('fail2ban-client stop ' . F2B_JAIL);
+            if ($run('fail2ban-client status ' . F2B_JAIL)[0] === 0) {
+                return ['ok' => false, 'result' => 'the files are removed but the jail nexovirt-pve is still running; run fail2ban-client reload on the node'];
+            }
+        }
+    }
+
+    return ['ok' => true, 'result' => nexovirt_json(['enabled' => false])];
+}
+
+/** Write (enabled) or remove (disabled) the NexoVirt fail2ban jail. @return array{ok:bool,result:string} */
+function nexovirt_apply_fail2ban(array $p, string $root, callable $run): array
+{
+    $v = nexovirt_f2b_validate($p);
+    if (! $v['ok']) {
+        return ['ok' => false, 'result' => 'invalid apply_fail2ban payload: ' . $v['error']];
+    }
+    $haveClient = $run('command -v fail2ban-client')[0] === 0;
+
+    if (! $v['cfg']['enabled']) {
+        return nexovirt_f2b_disable($root, $haveClient, $run);
+    }
+
+    $foreign = nexovirt_f2b_foreign_jails($root);
+    if ($foreign !== [] && empty($p['allow_existing'])) {
+        $names = implode(', ', array_map(static fn ($j) => "'" . $j['name'] . "' (" . $j['file'] . ')', $foreign));
+
+        return ['ok' => false, 'result' => 'fail2ban on ' . gethostname() . ' already has a jail for the web UI: ' . $names
+            . '. Tick "Add NexoVirt\'s jail next to it" to add NexoVirt\'s jail anyway. Nothing changed'];
+    }
+
+    $installed = false;
+    if (! $haveClient) {
+        $install = 'DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y fail2ban python3-systemd';
+        if ($run($install)[0] !== 0) {
+            $run('DEBIAN_FRONTEND=noninteractive timeout 150 apt-get update');
+            $run($install);
+        }
+        if ($run('command -v fail2ban-client')[0] !== 0) {
+            return ['ok' => false, 'result' => 'fail2ban is not installed and could not be installed; nothing changed'];
+        }
+        $installed = true;
+    } elseif (trim($run('systemctl is-active fail2ban')[1]) !== 'active') {
+        return ['ok' => false, 'result' => 'fail2ban is installed but not running on this node; NexoVirt does not start an existing fail2ban. Start it yourself, then try again. Nothing changed'];
+    }
+
+    // ignoreip is exactly localhost + the admin's panel_ip + ignore CIDRs (never log-derived addresses).
+    $cfg = $v['cfg'];
+    $wasRunning = ! $installed && $run('fail2ban-client status ' . F2B_JAIL)[0] === 0;
+    $oldJail    = is_file($root . F2B_JAIL_PATH) ? (string) file_get_contents($root . F2B_JAIL_PATH) : null;
+    $oldFilter  = is_file($root . F2B_FILTER_PATH) ? (string) file_get_contents($root . F2B_FILTER_PATH) : null;
+    @mkdir(dirname($root . F2B_FILTER_PATH), 0755, true);
+    @mkdir(dirname($root . F2B_JAIL_PATH), 0755, true);
+    if (@file_put_contents($root . F2B_FILTER_PATH, nexovirt_f2b_filter()) === false
+        || @file_put_contents($root . F2B_JAIL_PATH, nexovirt_f2b_jail($cfg)) === false) {
+        nexovirt_f2b_restore($root, $oldJail, $oldFilter);
+
+        return ['ok' => false, 'result' => 'cannot write the fail2ban files'];
+    }
+    [$tCode, $tOut] = $run('fail2ban-client -t');
+    if ($tCode !== 0) {
+        nexovirt_f2b_restore($root, $oldJail, $oldFilter);
+
+        return ['ok' => false, 'result' => 'the fail2ban configuration test failed, NexoVirt\'s files were taken back: ' . nexovirt_cap_output(trim((string) $tOut), 2000)];
+    }
+    if ($installed) {
+        [$code, $out] = $run('systemctl enable --now fail2ban');
+    } else {
+        // A jail fail2ban does not run yet only starts with a full reload ("reload <jail>" says it does not exist).
+        [$code, $out] = $run($wasRunning ? 'fail2ban-client reload ' . F2B_JAIL : 'fail2ban-client reload');
+    }
+    [$sCode] = $run('fail2ban-client status ' . F2B_JAIL);
+    if ($code !== 0 || $sCode !== 0) {
+        return ['ok' => false, 'result' => 'the jail did not start: ' . nexovirt_cap_output(trim((string) $out), 2000)];
+    }
+
+    return ['ok' => true, 'result' => nexovirt_json(['enabled' => true, 'installed_now' => $installed])];
+}
+
+/** Banned IPs + failure count from `fail2ban-client status <jail>`. PURE. */
+function nexovirt_f2b_parse_status(string $out): array
+{
+    $banned = [];
+    if (preg_match('/Banned IP list:\s*(.*)$/m', $out, $m) === 1) {
+        $banned = array_values(array_filter(preg_split('/\s+/', trim($m[1])) ?: [], static fn ($ip) => filter_var($ip, FILTER_VALIDATE_IP) !== false));
+    }
+    $failed = preg_match('/Currently failed:\s*(\d+)/', $out, $f) === 1 ? (int) $f[1] : 0;
+
+    return ['banned' => $banned, 'failed' => $failed];
+}
+
+/** Read-only fail2ban state of the node: our jail, hand-made web UI jails (with their bans), the panel's addresses. */
+function nexovirt_read_fail2ban(string $root, string $pveUser, callable $run): array
+{
+    $installed = $run('command -v fail2ban-client')[0] === 0;
+    $running   = $installed && trim($run('systemctl is-active fail2ban')[1]) === 'active';
+    $status    = ['banned' => [], 'failed' => 0];
+    $jail      = false;
+    if ($running) {
+        [$code, $out] = $run('fail2ban-client status ' . F2B_JAIL);
+        $jail         = $code === 0;
+        $status       = $jail ? nexovirt_f2b_parse_status($out) : $status;
+    }
+    $foreign = [];
+    foreach (nexovirt_f2b_foreign_jails($root) as $j) {
+        [$code, $out] = $running ? $run('fail2ban-client status ' . escapeshellarg($j['name'])) : [1, ''];
+        $foreign[]    = $j + ['active' => $code === 0, 'banned' => $code === 0 ? nexovirt_f2b_parse_status((string) $out)['banned'] : []];
+    }
+
+    return [
+        'installed' => $installed, 'running' => $running, 'jail_active' => $jail,
+        'files' => is_file($root . F2B_JAIL_PATH), 'banned' => $status['banned'], 'failed' => $status['failed'],
+        'foreign_jails' => $foreign, 'panel_addrs' => nexovirt_f2b_read_panel_addrs($root, $pveUser, $run),
+    ];
+}
+
+/** Lift one ban of the NexoVirt jail. @return array{ok:bool,result:string} */
+function nexovirt_f2b_unban(string $ip, callable $run): array
+{
+    if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
+        return ['ok' => false, 'result' => 'invalid fail2ban_unban payload'];
+    }
+    [$code, $out] = $run('fail2ban-client set ' . F2B_JAIL . ' unbanip ' . escapeshellarg($ip));
+
+    return ['ok' => $code === 0, 'result' => $code === 0 ? 'unbanned' : nexovirt_cap_output(trim($out), 2000)];
+}
+
+// ---------------------------------------------------------------------------
+// One-click apps: lxc_app_install, lxc_app_status (spec 2026-10-20-lxc-app-store-design)
+// ---------------------------------------------------------------------------
+
+const APP_DIR        = '/var/lib/nexovirt/app';
+const APP_LOG_DIR    = '/var/log/nexovirt';
+const APP_MAX_SCRIPT = 65536;
+const APP_MAX_ENV    = 20;
+const APP_ENV_RE     = '/^NX_[A-Z][A-Z0-9_]{0,30}$/';
+const APP_CT_DIR     = '/root/.nexovirt-app';
+
+/**
+ * The FIXED script that runs inside the container (no payload value is formatted into it): wait for
+ * DNS, load and delete the env file, then run the pushed install script with its output appended to
+ * /var/log/nexovirt-app.log inside the CT. Exit status = the install script's (pipefail).
+ */
+const APP_INNER = <<<'SH'
+set -o pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive
+for i in $(seq 1 60); do getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done
+set -a
+. /root/.nexovirt-app/env
+set +a
+rm -f /root/.nexovirt-app/env
+cd /root
+echo "=== NexoVirt app install $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> /var/log/nexovirt-app.log
+/bin/bash /root/.nexovirt-app/install.sh 2>&1 | tee -a /var/log/nexovirt-app.log
+SH;
+
+function nexovirt_app_unit(int $vmid): string
+{
+    return 'nexovirt-app-' . $vmid;
+}
+
+function nexovirt_app_log(int $vmid): string
+{
+    return APP_LOG_DIR . '/app-' . $vmid . '.log';
+}
+
+function nexovirt_app_exit_file(int $vmid): string
+{
+    return APP_LOG_DIR . '/app-' . $vmid . '.exit';
+}
+
+/**
+ * Validate an lxc_app_install payload (fail-closed). PURE.
+ *
+ * @param array<string,mixed> $p
+ * @return array{ok:bool, error?:string, vmid?:int, script?:string, env?:array<string,string>, timeout?:int}
+ */
+function nexovirt_app_validate(array $p): array
+{
+    $vmid = $p['vmid'] ?? null;
+    if (! is_int($vmid) || $vmid < 100 || $vmid > 999999999) {
+        return ['ok' => false, 'error' => 'invalid lxc_app_install payload: vmid'];
+    }
+    $script = $p['script'] ?? null;
+    $sha    = $p['sha256'] ?? null;
+    if (! is_string($script) || trim($script) === '' || strlen($script) > APP_MAX_SCRIPT || strpos($script, "\0") !== false) {
+        return ['ok' => false, 'error' => 'invalid lxc_app_install payload: script'];
+    }
+    if (! is_string($sha) || preg_match('/^[a-f0-9]{64}$/', $sha) !== 1 || ! hash_equals($sha, hash('sha256', $script))) {
+        return ['ok' => false, 'error' => 'invalid lxc_app_install payload: the script does not match its checksum'];
+    }
+    $env = $p['env'] ?? [];
+    if (! is_array($env) || count($env) > APP_MAX_ENV) {
+        return ['ok' => false, 'error' => 'invalid lxc_app_install payload: env'];
+    }
+    foreach ($env as $k => $v) {
+        if (! is_string($k) || preg_match(APP_ENV_RE, $k) !== 1 || ! is_string($v) || strlen($v) > 1024 || strpbrk($v, "\0\r\n") !== false) {
+            return ['ok' => false, 'error' => 'invalid lxc_app_install payload: env'];
+        }
+    }
+    $timeout = $p['timeout'] ?? null;
+    if (! is_int($timeout) || $timeout < 300 || $timeout > 7200) {
+        return ['ok' => false, 'error' => 'invalid lxc_app_install payload: timeout'];
+    }
+
+    return ['ok' => true, 'vmid' => $vmid, 'script' => $script, 'env' => $env, 'timeout' => $timeout];
+}
+
+/**
+ * The env file the inner script sources: one NAME='value' line per setting, single quotes escaped as
+ * '\''. Names and values are validated first (no NUL/CR/LF), so a value can never end the quoting. PURE.
+ *
+ * @param array<string,string> $env
+ */
+function nexovirt_app_env_file(array $env): string
+{
+    $out = '';
+    foreach ($env as $k => $v) {
+        $out .= $k . "='" . str_replace("'", "'\\''", $v) . "'\n";
+    }
+
+    return $out;
+}
+
+/** The host-side runner (only the integer vmid is formatted in). PURE. */
+function nexovirt_app_runner(int $vmid): string
+{
+    return "#!/bin/sh\n"
+        . 'pct exec ' . escapeshellarg((string) $vmid) . ' -- /bin/bash -c ' . escapeshellarg(APP_INNER) . "\n"
+        . 'echo "$?" > ' . escapeshellarg(nexovirt_app_exit_file($vmid)) . "\n";
+}
+
+/** The detached systemd-run command for a validated vmid + timeout. PURE. */
+function nexovirt_app_start_cmd(int $vmid, int $timeout): string
+{
+    $log = nexovirt_app_log($vmid);
+
+    return 'systemd-run --unit=' . nexovirt_app_unit($vmid) . ' --collect --quiet'
+        . ' --property=RuntimeMaxSec=' . $timeout
+        . ' --property=StandardOutput=append:' . $log . ' --property=StandardError=append:' . $log
+        . ' /bin/sh ' . escapeshellarg(APP_DIR . '/' . $vmid . '/run.sh');
+}
+
+/** Start a stopped CT and wait (bounded) until it runs. */
+function nexovirt_app_ensure_running(int $vmid): bool
+{
+    $id = escapeshellarg((string) $vmid);
+    if (strpos(nexovirt_run_cmd("pct status {$id} 2>&1"), 'running') !== false) {
+        return true;
+    }
+    nexovirt_run_cmd("pct start {$id} 2>&1", 120);
+    for ($i = 0; $i < 30; $i++) {
+        sleep(1);
+        if (strpos(nexovirt_run_cmd("pct status {$id} 2>&1"), 'running') !== false) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Push the install script + env into the CT and start the detached install. Returns at once.
+ *
+ * @param array<string,mixed> $p
+ * @return array{ok:bool, result?:array<string,mixed>, error?:string}
+ */
+function nexovirt_lxc_app_install(array $p): array
+{
+    $v = nexovirt_app_validate($p);
+    if (! $v['ok']) {
+        return ['ok' => false, 'error' => $v['error']];
+    }
+    $vmid = $v['vmid'];
+    $id   = escapeshellarg((string) $vmid);
+    $dir  = APP_DIR . '/' . $vmid;
+    if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1') {
+        return ['ok' => true, 'result' => ['started' => true, 'unit' => nexovirt_app_unit($vmid),
+            'env_file' => nexovirt_app_env_file($v['env']), 'runner' => nexovirt_app_runner($vmid),
+            'cmd' => nexovirt_app_start_cmd($vmid, $v['timeout'])]];
+    }
+    if (! nexovirt_bin_installed('pct') || ! nexovirt_bin_installed('systemd-run')) {
+        return ['ok' => false, 'error' => 'pct or systemd-run is not available on this node.'];
+    }
+    $code = 1;
+    $out  = [];
+    exec("pct config {$id} >/dev/null 2>&1", $out, $code);
+    if ($code !== 0) {
+        return ['ok' => false, 'error' => 'Container ' . $vmid . ' was not found on this node.'];
+    }
+    if (in_array(trim(nexovirt_run_cmd('systemctl is-active ' . nexovirt_app_unit($vmid))), ['active', 'activating', 'reloading'], true)) {
+        return ['ok' => false, 'error' => 'An app install is already running in container ' . $vmid . '.'];
+    }
+    if (! nexovirt_app_ensure_running($vmid)) {
+        return ['ok' => false, 'error' => 'Container ' . $vmid . ' did not start.'];
+    }
+    foreach ([APP_DIR, $dir, APP_LOG_DIR] as $d) {
+        if (! is_dir($d)) {
+            @mkdir($d, 0700, true);
+        }
+        @chmod($d, 0700);
+    }
+    @unlink(nexovirt_app_exit_file($vmid));
+    if (! nexovirt_write_private($dir . '/install.sh', $v['script'])
+        || ! nexovirt_write_private($dir . '/env', nexovirt_app_env_file($v['env']))
+        || ! nexovirt_write_private($dir . '/run.sh', nexovirt_app_runner($vmid))
+        || ! nexovirt_write_private(nexovirt_app_log($vmid), '')) {
+        @unlink($dir . '/env');
+
+        return ['ok' => false, 'error' => 'Could not write the install files in ' . APP_DIR . '.'];
+    }
+    $push = [
+        "pct exec {$id} -- /bin/sh -c " . escapeshellarg('mkdir -p ' . APP_CT_DIR . ' && chmod 700 ' . APP_CT_DIR),
+        "pct push {$id} " . escapeshellarg($dir . '/install.sh') . ' ' . escapeshellarg(APP_CT_DIR . '/install.sh') . ' --perms 0700',
+        "pct push {$id} " . escapeshellarg($dir . '/env') . ' ' . escapeshellarg(APP_CT_DIR . '/env') . ' --perms 0600',
+    ];
+    foreach ($push as $cmd) {
+        $o = [];
+        $c = 1;
+        exec($cmd . ' 2>&1', $o, $c);
+        if ($c !== 0) {
+            @unlink($dir . '/env');
+
+            return ['ok' => false, 'error' => 'Could not copy the install script into the container: ' . nexovirt_cap_output(implode("\n", $o), 500)];
+        }
+    }
+    @unlink($dir . '/env'); // the secrets now live only in the CT, until the inner script deletes them
+    $o = [];
+    $c = 1;
+    exec(nexovirt_app_start_cmd($vmid, $v['timeout']) . ' 2>&1', $o, $c);
+    if ($c !== 0) {
+        return ['ok' => false, 'error' => 'Could not start the install: ' . nexovirt_cap_output(implode("\n", $o), 500)];
+    }
+
+    return ['ok' => true, 'result' => ['started' => true, 'unit' => nexovirt_app_unit($vmid)]];
+}
+
+/**
+ * While the install runs, hand out whole lines only (a trailing partial line is read again next time),
+ * so the panel can use the byte offset as is. A full chunk without any newline is passed through. PURE.
+ *
+ * @param array{log:string,offset:int} $tail
+ * @return array{log:string,offset:int}
+ */
+function nexovirt_app_whole_lines(array $tail, bool $running): array
+{
+    $cut = strrpos($tail['log'], "\n");
+    if (! $running || strlen($tail['log']) >= APT_LOG_CHUNK) {
+        return $tail;
+    }
+    $keep = $cut === false ? 0 : $cut + 1;
+
+    return ['log' => substr($tail['log'], 0, $keep), 'offset' => $tail['offset'] - (strlen($tail['log']) - $keep)];
+}
+
+/**
+ * State of an app install: running / succeeded / failed (+ exit code) / idle, and the log after $offset.
+ *
+ * @return array<string,mixed>
+ */
+function nexovirt_lxc_app_status(int $vmid, int $offset): array
+{
+    if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1') {
+        $log = "[nexovirt-app] Installing\n[nexovirt-app] Ready.\n";
+
+        return ['state' => 'succeeded', 'exit_code' => 0, 'log' => substr($log, min($offset, strlen($log))), 'offset' => strlen($log)];
+    }
+    $active = trim(nexovirt_run_cmd('systemctl is-active ' . nexovirt_app_unit($vmid)));
+    $exit   = is_readable(nexovirt_app_exit_file($vmid)) ? trim((string) @file_get_contents(nexovirt_app_exit_file($vmid))) : '';
+    $code   = null;
+    if (in_array($active, ['active', 'activating', 'reloading'], true)) {
+        $state = 'running';
+    } elseif ($exit !== '' && ctype_digit($exit)) {
+        $code  = (int) $exit;
+        $state = $code === 0 ? 'succeeded' : 'failed';
+    } else {
+        // No exit code: killed (timeout) or never started.
+        $state = is_file(nexovirt_app_log($vmid)) ? 'failed' : 'idle';
+    }
+    $tail = nexovirt_log_tail(nexovirt_app_log($vmid), $offset);
+    $tail = nexovirt_app_whole_lines($tail, $state === 'running');
+
+    return ['state' => $state, 'exit_code' => $code, 'log' => $tail['log'], 'offset' => $tail['offset']];
+}
+
+// ---------------------------------------------------------------------------
+// Backup jobs: disks per job (vzdump hook, agent 0.27.0)
+// ---------------------------------------------------------------------------
+// PVE reads a disk's backup flag from the guest config before the guest is backed up and has no per-job
+// disk list. A job with a disk selection runs `<hook dir>/<job>.sh`, which calls this agent with
+// `--vzdump-hook <job> <phase> [mode vmid]`: job-start sets the listed disks of this node's guests to the
+// wanted flag (compare-and-set, every change recorded in <job>.state), backup-end/backup-abort puts that
+// guest's disks back, job-end/job-abort puts back what is left. A disk changed by someone in between is
+// left alone. The hook never fails the backup: a disk it could not switch is backed up as configured.
+
+const NEXOVIRT_BACKUP_HOOK_DIR = '/var/lib/nexovirt/backup-hooks';
+
+function nexovirt_backup_hook_dir(): string
+{
+    $d = getenv('NEXOVIRT_AGENT_BACKUP_HOOK_DIR');
+
+    return is_string($d) && $d !== '' ? rtrim($d, '/') : NEXOVIRT_BACKUP_HOOK_DIR;
+}
+
+function nexovirt_backup_hook_path(string $jobId): string
+{
+    return nexovirt_backup_hook_dir() . '/' . $jobId . '.sh';
+}
+
+function nexovirt_valid_backup_job_id(string $id): bool
+{
+    return preg_match('/^[A-Za-z][A-Za-z0-9_-]{2,63}$/', $id) === 1;
+}
+
+/** The disk value with backup=0|1 set: an existing backup= part is replaced in place, else appended. */
+function nexovirt_backup_flag_value(string $value, bool $include): string
+{
+    $parts = explode(',', $value);
+    $flag  = 'backup=' . ($include ? '1' : '0');
+    $found = false;
+    foreach ($parts as $i => $p) {
+        if ($i > 0 && str_starts_with($p, 'backup=')) {
+            $parts[$i] = $flag;
+            $found     = true;
+        }
+    }
+    if (! $found) {
+        $parts[] = $flag;
+    }
+
+    return implode(',', $parts);
+}
+
+/**
+ * Fail-closed payload check: {jobs: {<id>: {guests: [{vmid, type, disks: {<key>: bool}}]}}}.
+ *
+ * @return array{ok:bool,jobs:array<string,array{guests:list<array{vmid:int,type:string,disks:array<string,bool>}>}>,error:string}
+ */
+function nexovirt_validate_backup_hooks(array $p): array
+{
+    $bad  = static fn (string $e): array => ['ok' => false, 'jobs' => [], 'error' => $e];
+    $jobs = $p['jobs'] ?? [];
+    if (! is_array($jobs) || count($jobs) > 500) {
+        return $bad('jobs must be a map');
+    }
+    $out = [];
+    foreach ($jobs as $id => $job) {
+        if (! is_string($id) || ! nexovirt_valid_backup_job_id($id) || ! is_array($job) || ! is_array($job['guests'] ?? null) || count($job['guests']) > 1000) {
+            return $bad('invalid job');
+        }
+        $guests = [];
+        foreach ($job['guests'] as $g) {
+            $type  = is_array($g) ? ($g['type'] ?? '') : '';
+            $vmid  = is_array($g) ? ($g['vmid'] ?? 0) : 0;
+            $disks = is_array($g) ? ($g['disks'] ?? null) : null;
+            if (! in_array($type, ['qemu', 'lxc'], true) || ! is_int($vmid) || $vmid < 100 || $vmid > 999999999 || ! is_array($disks) || count($disks) > 64) {
+                return $bad('invalid guest');
+            }
+            $keyRe = $type === 'lxc' ? '/^mp\d{1,3}$/' : '/^(scsi|sata|ide|virtio)\d{1,2}$/';
+            $clean = [];
+            foreach ($disks as $k => $on) {
+                if (! is_string($k) || preg_match($keyRe, $k) !== 1 || ! is_bool($on)) {
+                    return $bad('invalid disk');
+                }
+                $clean[$k] = $on;
+            }
+            $guests[] = ['vmid' => $vmid, 'type' => $type, 'disks' => $clean];
+        }
+        $out[$id] = ['guests' => $guests];
+    }
+
+    return ['ok' => true, 'jobs' => $out, 'error' => ''];
+}
+
+/** Atomic write (tmp + rename) with the mode set before the rename. */
+function nexovirt_backup_hook_put(string $file, string $content, int $mode): bool
+{
+    $tmp = $file . '.tmp';
+
+    return @file_put_contents($tmp, $content) !== false && @chmod($tmp, $mode) && @rename($tmp, $file);
+}
+
+/**
+ * Write the full desired set of hooks: <job>.json + <job>.sh per job; hooks of jobs no longer listed are
+ * removed (their leftover changes put back first).
+ *
+ * @return array{ok:bool,result:string}
+ */
+function nexovirt_backup_hooks_apply(array $jobs, ?callable $write = null): array
+{
+    $dir = nexovirt_backup_hook_dir();
+    if (! is_dir($dir) && ! @mkdir($dir, 0700, true)) {
+        return ['ok' => false, 'result' => 'could not create ' . $dir];
+    }
+    foreach ($jobs as $id => $job) {
+        $php = is_executable('/usr/bin/php') ? '/usr/bin/php' : PHP_BINARY; // survives a PHP minor upgrade
+        $sh  = "#!/bin/sh\n# NexoVirt: disks of backup job {$id}. Managed by the NexoVirt agent.\nexec "
+            . escapeshellarg($php) . ' ' . escapeshellarg(__FILE__) . ' --vzdump-hook ' . escapeshellarg($id) . " \"\$@\"\n";
+        if (! nexovirt_backup_hook_put("{$dir}/{$id}.json", json_encode($job), 0600) || ! nexovirt_backup_hook_put("{$dir}/{$id}.sh", $sh, 0755)) {
+            return ['ok' => false, 'result' => 'could not write the hook of ' . $id];
+        }
+    }
+    foreach (glob($dir . '/*.json') ?: [] as $file) {
+        $id = basename($file, '.json');
+        if (isset($jobs[$id])) {
+            continue;
+        }
+        if (is_file("{$dir}/{$id}.state")) {
+            nexovirt_backup_hook_restore($id, null, $write ?? 'nexovirt_backup_flag_write');
+        }
+        @unlink($file);
+        @unlink("{$dir}/{$id}.sh");
+    }
+
+    return ['ok' => true, 'result' => count($jobs) . ' backup job hook(s)'];
+}
+
+/** Value of $key in the guest's live config section (lines before the first [snapshot] header), null if absent. */
+function nexovirt_backup_conf_value(string $type, int $vmid, string $key): ?string
+{
+    $etc  = getenv('NEXOVIRT_AGENT_PVE_ETC');
+    $file = (is_string($etc) && $etc !== '' ? $etc : '/etc/pve') . ($type === 'lxc' ? '/lxc/' : '/qemu-server/') . $vmid . '.conf';
+    $raw  = @file_get_contents($file);
+    if ($raw === false) {
+        return null;
+    }
+    foreach (explode("\n", $raw) as $line) {
+        if (str_starts_with($line, '[')) {
+            break;
+        }
+        if (str_starts_with($line, $key . ':')) {
+            return trim(substr($line, strlen($key) + 1));
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Compare-and-set one config key under PVE's config lock, straight into the config (not pending), so it
+ * holds for running guests too. False when the value is no longer $old or the write failed.
+ */
+function nexovirt_backup_flag_write(string $type, int $vmid, string $key, string $old, string $new): bool
+{
+    $perl = 'use strict; use warnings; use PVE::QemuConfig; use PVE::LXC::Config;'
+        . ' my $c = $ENV{NX_T} eq "lxc" ? "PVE::LXC::Config" : "PVE::QemuConfig"; my $v = $ENV{NX_VMID};'
+        . ' $c->lock_config($v, sub { my $conf = $c->load_config($v);'
+        . ' die "changed\n" if !defined($conf->{$ENV{NX_KEY}}) || $conf->{$ENV{NX_KEY}} ne $ENV{NX_OLD};'
+        . ' $conf->{$ENV{NX_KEY}} = $ENV{NX_NEW}; $c->write_config($v, $conf); }); print "ok\n";';
+    $cmd = 'NX_T=' . escapeshellarg($type) . ' NX_VMID=' . escapeshellarg((string) $vmid) . ' NX_KEY=' . escapeshellarg($key)
+        . ' NX_OLD=' . escapeshellarg($old) . ' NX_NEW=' . escapeshellarg($new) . ' perl -e ' . escapeshellarg($perl) . ' 2>&1';
+
+    return trim(nexovirt_run_cmd($cmd, 30)) === 'ok';
+}
+
+/** @return list<array{vmid:int,type:string,key:string,set:string,orig:string}> */
+function nexovirt_backup_state_read(string $jobId): array
+{
+    $s = json_decode((string) @file_get_contents(nexovirt_backup_hook_dir() . '/' . $jobId . '.state'), true);
+
+    return is_array($s) ? array_values(array_filter($s, 'is_array')) : [];
+}
+
+function nexovirt_backup_state_write(string $jobId, array $state): void
+{
+    $file = nexovirt_backup_hook_dir() . '/' . $jobId . '.state';
+    if ($state === []) {
+        @unlink($file);
+
+        return;
+    }
+    nexovirt_backup_hook_put($file, json_encode(array_values($state)), 0600);
+}
+
+/**
+ * Put back the recorded changes of one guest ($vmid) or all. A disk whose value is no longer the one the
+ * hook set was changed by someone else and is left alone.
+ *
+ * @return list<string> log lines
+ */
+function nexovirt_backup_hook_restore(string $jobId, ?int $vmid, callable $write): array
+{
+    $log  = [];
+    $keep = [];
+    foreach (nexovirt_backup_state_read($jobId) as $e) {
+        if ($vmid !== null && (int) $e['vmid'] !== $vmid) {
+            $keep[] = $e;
+            continue;
+        }
+        $cur = nexovirt_backup_conf_value((string) $e['type'], (int) $e['vmid'], (string) $e['key']);
+        if ($cur !== (string) $e['set']) {
+            $log[] = "NexoVirt: {$e['vmid']} {$e['key']} was changed during the backup, left as is";
+            continue;
+        }
+        $log[] = $write((string) $e['type'], (int) $e['vmid'], (string) $e['key'], (string) $e['set'], (string) $e['orig'])
+            ? "NexoVirt: {$e['vmid']} {$e['key']} backup flag restored"
+            : "NexoVirt: {$e['vmid']} {$e['key']} could not be restored";
+    }
+    nexovirt_backup_state_write($jobId, $keep);
+
+    return $log;
+}
+
+/**
+ * The hook. Never fails the backup.
+ *
+ * @return list<string> log lines (printed into the vzdump task log)
+ */
+function nexovirt_backup_hook_run(string $jobId, string $phase, ?int $vmid, ?callable $write = null): array
+{
+    $write ??= 'nexovirt_backup_flag_write';
+    if (! nexovirt_valid_backup_job_id($jobId)) {
+        return ['NexoVirt: invalid job id'];
+    }
+    if (in_array($phase, ['backup-end', 'backup-abort'], true) && $vmid !== null) {
+        return nexovirt_backup_hook_restore($jobId, $vmid, $write);
+    }
+    if (in_array($phase, ['job-end', 'job-abort'], true)) {
+        return nexovirt_backup_hook_restore($jobId, null, $write);
+    }
+    if ($phase !== 'job-start') {
+        return [];
+    }
+    $log = nexovirt_backup_hook_restore($jobId, null, $write); // leftovers of an interrupted run
+    $job = json_decode((string) @file_get_contents(nexovirt_backup_hook_dir() . '/' . $jobId . '.json'), true);
+    $ok  = nexovirt_validate_backup_hooks(['jobs' => [$jobId => is_array($job) ? $job : []]]);
+    if (! $ok['ok']) {
+        return array_merge($log, ['NexoVirt: disk selection unreadable, disks are backed up as configured']);
+    }
+    $state = [];
+    foreach ($ok['jobs'][$jobId]['guests'] as $g) {
+        foreach ($g['disks'] as $key => $include) {
+            $cur = nexovirt_backup_conf_value($g['type'], $g['vmid'], $key);
+            if ($cur === null) {
+                continue; // guest not on this node, or the disk is gone
+            }
+            $new = nexovirt_backup_flag_value($cur, $include);
+            if ($new === $cur) {
+                continue;
+            }
+            if ($write($g['type'], $g['vmid'], $key, $cur, $new)) {
+                $state[] = ['vmid' => $g['vmid'], 'type' => $g['type'], 'key' => $key, 'set' => $new, 'orig' => $cur];
+                nexovirt_backup_state_write($jobId, $state); // recorded right away: a crash can always be undone
+                $log[] = "NexoVirt: {$g['vmid']} {$key} " . ($include ? 'included in' : 'excluded from') . ' this backup';
+            } else {
+                $log[] = "NexoVirt: {$g['vmid']} {$key} could not be switched, backed up as configured";
+            }
+        }
+    }
+
+    return $log;
+}
+
+/** Put back the changes of jobs that ended without their job-end hook (node crash, killed task). */
+function nexovirt_backup_hooks_recover(?callable $write = null, ?callable $backupRunning = null): void
+{
+    $files = glob(nexovirt_backup_hook_dir() . '/*.state') ?: [];
+    if ($files === []) {
+        return;
+    }
+    $running = $backupRunning ?? static function (): bool {
+        exec('pgrep -f ' . escapeshellarg(':vzdump:') . ' >/dev/null 2>&1', $o, $code);
+
+        return $code === 0;
+    };
+    if ($running()) {
+        return;
+    }
+    foreach ($files as $f) {
+        nexovirt_backup_hook_restore(basename($f, '.state'), null, $write ?? 'nexovirt_backup_flag_write');
+    }
+}
+
 /**
  * Execute one job. Returns ['id'=>int, 'ok'=>bool, 'result'=>string].
  * Allowlisted job types only (`write_snippet`, `ensure_storage`, `download_image`,
@@ -3355,6 +5865,15 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
         return $w['ok']
             ? ['id' => $id, 'ok' => true, 'result' => nexovirt_snippet_ref($storage, $name)]
             : ['id' => $id, 'ok' => false, 'result' => $w['error']];
+    }
+
+    if ($type === 'backup_hooks_apply') {
+        $v = nexovirt_validate_backup_hooks($p);
+        if (! $v['ok']) {
+            return ['id' => $id, 'ok' => false, 'result' => 'invalid backup_hooks_apply payload: ' . $v['error']];
+        }
+        $r = nexovirt_backup_hooks_apply($v['jobs']);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
     if ($type === 'ensure_storage') {
@@ -3492,6 +6011,21 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
+    if ($type === 'nat_inventory') {
+        // Read-only (NAT adoption scan + verify); the only field is the validated probe list.
+        $r = nexovirt_nat_inventory($p);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['ok'] ? nexovirt_json($r['result']) : $r['result']];
+    }
+
+    if ($type === 'nat_adopt_finalize' || $type === 'nat_adopt_restore') {
+        // NAT adoption switch-off / restore: every field is re-validated against the node's own allowlists.
+        $dry  = getenv('NEXOVIRT_AGENT_DRYRUN') === '1';
+        $root = $dry ? (string) getenv('NEXOVIRT_AGENT_ETC_ROOT') : '';
+        $run  = $dry ? nexovirt_nat_adopt_dry_runner() : null;
+        $r    = $type === 'nat_adopt_finalize' ? nexovirt_nat_adopt_finalize($p, $root, $run) : nexovirt_nat_adopt_restore($p, $root, $run);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['ok'] ? nexovirt_json($r['result']) : $r['result']];
+    }
+
     if ($type === 'guest_unlock') {
         $r = nexovirt_guest_unlock((string) ($p['type'] ?? ''), $p['vmid'] ?? 0);
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
@@ -3507,6 +6041,31 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
         $r = nexovirt_dyndns_configure($p);
 
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['ok'] ? ($p['enabled'] ? 'configured' : 'removed') : $r['error']];
+    }
+
+    if ($type === 'apply_dhcp') {
+        // Full desired set of NexoVirt DHCP instances; re-validated fail-closed, refuses next to a foreign DHCP server.
+        [$root, $run] = nexovirt_node_ctx($config);
+        $r = nexovirt_apply_dhcp($p, $root, $run);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
+    if ($type === 'apply_fail2ban') {
+        [$root, $run] = nexovirt_node_ctx($config);
+        $r = nexovirt_apply_fail2ban($p, $root, $run);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
+    if ($type === 'read_fail2ban') {
+        // Read-only; pve_user (validated) picks the panel's lines in pveproxy's access.log.
+        [$root, $run] = nexovirt_node_ctx();
+        return ['id' => $id, 'ok' => true, 'result' => nexovirt_json(nexovirt_read_fail2ban($root, (string) ($p['pve_user'] ?? ''), $run))];
+    }
+
+    if ($type === 'fail2ban_unban') {
+        [, $run] = nexovirt_node_ctx();
+        $r = nexovirt_f2b_unban((string) ($p['ip'] ?? ''), $run);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
     if ($type === 'apt_refresh') {
@@ -3534,6 +6093,20 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
     if ($type === 'apt_upgrade_status') {
         // Read-only; the only field is the numeric log offset.
         return ['id' => $id, 'ok' => true, 'result' => nexovirt_json(nexovirt_apt_upgrade_status(max(0, (int) ($p['offset'] ?? 0))))];
+    }
+
+    if ($type === 'lxc_app_install') {
+        // Every field is re-validated here (vmid, script checksum, env names/values, timeout).
+        $r = nexovirt_lxc_app_install($p);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['ok'] ? nexovirt_json($r['result']) : $r['error']];
+    }
+
+    if ($type === 'lxc_app_status') {
+        $vmid = $p['vmid'] ?? null;
+        if (! is_int($vmid) || $vmid < 100) {
+            return ['id' => $id, 'ok' => false, 'result' => 'invalid lxc_app_status payload'];
+        }
+        return ['id' => $id, 'ok' => true, 'result' => nexovirt_json(nexovirt_lxc_app_status($vmid, max(0, (int) ($p['offset'] ?? 0))))];
     }
 
     return ['id' => $id, 'ok' => false, 'result' => 'unsupported job type'];
@@ -3788,6 +6361,15 @@ if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1' && ($argv[1] ?? '') === '--image-do
     exit($r['ok'] ? 0 : 1);
 }
 
+// vzdump hook of a backup job with a disk selection (written by backup_hooks_apply).
+if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1' && ($argv[1] ?? '') === '--vzdump-hook') {
+    $hookVmid = isset($argv[5]) && ctype_digit((string) $argv[5]) ? (int) $argv[5] : null;
+    foreach (nexovirt_backup_hook_run((string) ($argv[2] ?? ''), (string) ($argv[3] ?? ''), $hookVmid) as $line) {
+        fwrite(STDOUT, $line . "\n");
+    }
+    exit(0);
+}
+
 if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1') {
     $config = loadConfig();
 
@@ -3851,6 +6433,7 @@ if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1') {
         $dyndnsLast = nexovirt_dyndns_tick($dyndnsLast, time());
         if (time() - $sweepLast >= 3600) {
             nexovirt_images_sweep(time());
+            nexovirt_backup_hooks_recover();
             $sweepLast = time();
         }
 
