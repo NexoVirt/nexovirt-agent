@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.27.0';
+const AGENT_VERSION        = '0.27.1';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -4051,6 +4051,10 @@ function nexovirt_set_ip_forward(bool $enabled): array
     // network (and nexovirt-nat.service would turn it back on at the next boot anyway).
     if (! $enabled && nexovirt_nat_active()) {
         return ['ok' => false, 'result' => 'NexoVirt NAT is active on this host and requires IPv4 forwarding; clear the NAT configuration first'];
+    }
+    // The NexoVirt VPN routes its clients to the guests: forwarding off would cut every VPN client off.
+    if (! $enabled && (is_file(WG_UNIT_PATH) || is_file(WG_SYSCTL_PATH))) {
+        return ['ok' => false, 'result' => 'The NexoVirt VPN is active on this host and requires IPv4 forwarding; turn the VPN off first'];
     }
     if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1') {
         return ['ok' => true, 'result' => 'ip_forward ' . ($enabled ? 'enabled' : 'disabled') . ' (dryrun)'];

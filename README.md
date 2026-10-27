@@ -1,7 +1,7 @@
 # NexoVirt Host Agent
 
 The node agent of [NexoVirt](https://nexovirt.com), the self-hosted control panel for Proxmox VE.
-One standalone PHP file (`nexovirt-agent.php`, version **0.27.0**) that runs as root on a Proxmox VE node,
+One standalone PHP file (`nexovirt-agent.php`, version **0.27.1**) that runs as root on a Proxmox VE node,
 sends a heartbeat to your NexoVirt panel and runs a fixed, allowlisted set of jobs the panel queues for it.
 
 - Website: [nexovirt.com](https://nexovirt.com)
@@ -51,7 +51,7 @@ opening a public issue.
 | `image_cache_start` | (0.24.0) `{url, filename: nxc-<templateId>-<10 hex>.<ext>, expected_sha256?}`: starts a DETACHED download into the image cache (`systemd-run --unit=nexovirt-img-<hash>`, the agent script in `--image-download <file>` mode) and returns at once, so the agent keeps taking jobs. Same SSRF/redirect/content rules as `download_image`, plus: https required unless a SHA-256 is given, resume of an existing `.part` (`curl -C -`), no total time cap (stall guard: under 1 KiB/s for 5 min aborts), free space checked against the remaining Content-Length + 1 GiB while running, SHA-256 computed and verified (mismatch deletes the file). State per file in `<images>/.nexovirt-state/<file>.json`. Every heartbeat carries `stats.images` (name, size, state ready/queued/running/verifying/error/other, bytes, total, sha256, error) and `stats.images_free`. `delete_image` on a cached file also stops its download and removes its state. Stale `.part` files (untouched 24 h, no live download) are swept hourly |
 | `apply_nat` / `clear_nat` | Programs / removes NexoVirt NAT + port-forwards in the dedicated `NEXOVIRT-*` iptables chains only |
 | `read_firewall`, `read_system`, `read_pve`, `read_logs`, `read_pve_logs` | Read-only host inspection |
-| `probe_sdn_dhcp`, `ensure_sdn_dhcp`, `ensure_sdn_egress`, `set_ip_forward` | SDN DHCP backend + IPv4 forwarding (forwarding cannot be turned off while NexoVirt NAT is active) |
+| `probe_sdn_dhcp`, `ensure_sdn_dhcp`, `ensure_sdn_egress`, `set_ip_forward` | SDN DHCP backend + IPv4 forwarding (forwarding cannot be turned off while NexoVirt NAT or the NexoVirt VPN is active) |
 | `lxc_root_ssh`, `lxc_set_password` | Enable root SSH / set the root password inside an LXC (starts a stopped CT first) |
 | `scan_ips` | Ping + ARP sweep of a private CIDR (max /22) for IPAM |
 | `probe_tcp` | TCP reachability probe (host = IP or DNS name, port 1-65535, 5s timeout) used by migration pre-flight |
