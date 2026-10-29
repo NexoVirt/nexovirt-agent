@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.28.4';
+const AGENT_VERSION        = '0.28.5';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -6230,7 +6230,8 @@ function nexovirt_isolation_tick(): array
 // `arp-scan --localnet` in an isolated guest listed every LAN device behind the uplink (customer report
 // 2026-10-29). For every isolated port whose NIC has a static IPv4 + gateway, NexoVirt's OWN nft table
 // `bridge nexovirt_arp` drops ARP requests that ask for anything but the gateway or the guest's own address,
-// and ARP replies that claim another address. Only that table is ever created or deleted (pve-firewall's
+// and (0.28.5, security review) every ARP packet whose sender IP is not the guest's own (0.0.0.0 allowed for
+// duplicate address probes) or whose Ethernet / ARP sender MAC is not the NIC's configured MAC. Only that table is ever created or deleted (pve-firewall's
 // ebtables/nft tables are never touched); NICs without a static address (DHCP) are not filtered. IPv4 only.
 
 const ARP_TABLE = 'nexovirt_arp';
@@ -6265,8 +6266,29 @@ function nexovirt_arp_nic(string $conf, string $type, int $idx): ?array
     if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false || filter_var($gw, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
         return null;
     }
+    // The NIC's MAC: LXC hwaddr=, QEMU <model>=<mac> on netN ('' when unknown: no MAC rules then).
+    $mac = '';
+    if (preg_match('/^net' . $idx . ':\s*(.+)$/m', $conf, $n) === 1 && preg_match('/(?:^|,)[a-z0-9]+=((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})(?:,|$)/', trim($n[1]), $mm) === 1) {
+        $mac = strtolower($mm[1]);
+    }
 
-    return ['ips' => [$ip], 'gw' => $gw];
+    return ['ips' => [$ip], 'gw' => $gw, 'mac' => $mac];
+}
+
+/** VLAN ids of a NIC configured as a trunk (`trunks=10;20` on netN), [] when it is not one. PURE. */
+function nexovirt_arp_trunks(string $conf, int $idx): array
+{
+    if (preg_match('/^net' . $idx . ':\s*(.+)$/m', $conf, $m) !== 1 || preg_match('/(?:^|,)trunks=([0-9;]+)(?:,|$)/', trim($m[1]), $t) !== 1) {
+        return [];
+    }
+    $ids = [];
+    foreach (explode(';', $t[1]) as $id) {
+        if (ctype_digit($id) && (int) $id >= 1 && (int) $id <= 4094) {
+            $ids[] = (int) $id;
+        }
+    }
+
+    return array_values(array_unique($ids));
 }
 
 /**
@@ -6283,21 +6305,46 @@ function nexovirt_arp_ruleset(array $ports, callable $conf): string
         }
         $vmid  = (int) $m[2];
         $types = $m[1] === 'tap' ? ['qemu'] : ($m[1] === 'veth' ? ['lxc'] : ['lxc', 'qemu']);
-        $nic   = null;
+        $c     = '';
+        $type  = '';
         foreach ($types as $t) {
             $c = (string) $conf($t, $vmid);
             if ($c !== '') {
-                $nic = nexovirt_arp_nic($c, $t, (int) $m[3]);
+                $type = $t;
                 break;
             }
+        }
+        if ($c === '') {
+            continue;
+        }
+        $nic    = nexovirt_arp_nic($c, $type, (int) $m[3]);
+        $trunks = nexovirt_arp_trunks($c, (int) $m[3]);
+        $p      = "\t\tiifname \"{$port}\" ";
+        // Tagged frames from the guest would skip every "ether type arp" rule (and hop VLANs on a VLAN-aware
+        // bridge): dropped, unless PVE configures the NIC as a trunk (0.28.5, security review). A plain tag=
+        // is added by PVE on the bridge side, so the guest itself sends untagged frames.
+        $rules[] = $p . 'ether type 0x8035 drop'; // RARP: never needed from a guest
+        if ($trunks === []) {
+            $rules[] = $p . 'ether type { 8021q, 8021ad } drop';
+        } else {
+            $rules[] = $p . 'ether type 8021ad drop';
+            $rules[] = $p . 'ether type 8021q vlan type { 8021q, 8021ad } drop'; // double tag: VLAN hopping
+            $rules[] = $p . 'ether type 8021q vlan id != { ' . implode(', ', $trunks) . ' } drop';
         }
         if ($nic === null) {
             continue;
         }
-        $allow   = implode(', ', array_values(array_unique(array_merge([$nic['gw']], $nic['ips']))));
-        $own     = implode(', ', $nic['ips']);
-        $rules[] = "\t\tiifname \"{$port}\" ether type arp arp operation request arp daddr ip != { {$allow} } drop";
-        $rules[] = "\t\tiifname \"{$port}\" ether type arp arp operation reply arp saddr ip != { {$own} } drop";
+        $allow = implode(', ', array_values(array_unique(array_merge([$nic['gw']], $nic['ips']))));
+        $own   = implode(', ', array_merge(['0.0.0.0'], $nic['ips']));
+        $match = $trunks === [] ? ['ether type arp '] : ['ether type arp ', 'ether type 8021q vlan type arp '];
+        foreach ($match as $mt) {
+            $rules[] = $p . $mt . "arp saddr ip != { {$own} } drop";
+            if (($nic['mac'] ?? '') !== '') {
+                $rules[] = $p . $mt . "ether saddr != {$nic['mac']} drop";
+                $rules[] = $p . $mt . "arp saddr ether != {$nic['mac']} drop";
+            }
+            $rules[] = $p . $mt . "arp operation request arp daddr ip != { {$allow} } drop";
+        }
     }
     if ($rules === []) {
         return '';
@@ -6307,35 +6354,51 @@ function nexovirt_arp_ruleset(array $ports, callable $conf): string
         . "\t\ttype filter hook prerouting priority -300; policy accept;\n" . implode("\n", $rules) . "\n\t}\n}\n";
 }
 
-/** Apply the ARP filter for the desired isolated ports when it changed (or vanished). Never throws. */
-function nexovirt_arp_filter_sync(array $desired): void
+/** Run a command for the ARP filter: [exit code, output]. */
+function nexovirt_arp_exec(string $cmd): array
+{
+    $out = [];
+    exec($cmd . ' 2>&1', $out, $code);
+
+    return [$code, implode("\n", $out)];
+}
+
+/**
+ * Apply the ARP filter for the desired isolated ports when it changed (or vanished). Never throws.
+ * $run / $conf are test seams (a given $run skips the DRYRUN and nft checks).
+ */
+function nexovirt_arp_filter_sync(array $desired, ?callable $run = null, ?callable $conf = null): void
 {
     try {
-        if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1' || ! nexovirt_bin_installed('nft')) {
-            return;
+        if ($run === null) {
+            if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1' || ! nexovirt_bin_installed('nft')) {
+                return;
+            }
+            $run = 'nexovirt_arp_exec';
         }
-        $script = nexovirt_arp_ruleset($desired, 'nexovirt_guest_conf');
+        $script = nexovirt_arp_ruleset($desired, $conf ?? 'nexovirt_guest_conf');
         $last   = $GLOBALS['nexovirt_arp_last'] ?? null;
         $check  = time() - (int) ($GLOBALS['nexovirt_arp_checked'] ?? 0) >= 30;
         if ($script === $last && ! $check) {
             return;
         }
         $GLOBALS['nexovirt_arp_checked'] = time();
-        $exists = nexovirt_run_cmd('nft list table bridge ' . ARP_TABLE . ' 2>/dev/null') !== '';
+        // The exit code decides: nft's error text on a missing table must not count as "exists" (0.28.5).
+        $exists = $run('nft list table bridge ' . ARP_TABLE)[0] === 0;
         if ($script === $last && ($script === '') !== $exists) {
             return; // still as applied
         }
         if ($script === '') {
             if ($exists) {
-                exec('nft delete table bridge ' . ARP_TABLE . ' 2>&1');
+                $run('nft delete table bridge ' . ARP_TABLE);
             }
         } else {
             $tmp = tempnam(sys_get_temp_dir(), 'nxarp');
             file_put_contents($tmp, $script);
-            exec('nft -f ' . escapeshellarg($tmp) . ' 2>&1', $out, $code);
+            [$code, $out] = $run('nft -f ' . escapeshellarg($tmp));
             @unlink($tmp);
             if ($code !== 0) {
-                fwrite(STDERR, '[nexovirt-agent] ARP filter not applied: ' . implode(' ', $out) . PHP_EOL);
+                fwrite(STDERR, '[nexovirt-agent] ARP filter not applied: ' . str_replace("\n", ' ', (string) $out) . PHP_EOL);
                 return;
             }
         }
