@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.28.1';
+const AGENT_VERSION        = '0.28.2';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -305,7 +305,7 @@ function nexovirt_write_private(string $path, string $content): bool
     $tmp = $path . '.tmp';
     $old = umask(0077);
     try {
-        if (@file_put_contents($tmp, $content) === false) {
+        if (@file_put_contents($tmp, $content, LOCK_EX) === false) {
             return false;
         }
         @chmod($tmp, 0600);
@@ -755,6 +755,7 @@ function nexovirt_run_with_ticks(string $cmd, ?callable $tick, int $tickEvery = 
                 return ['code' => -2, 'out' => $out . "\naborted"];
             }
         }
+        nexovirt_isolation_tick_throttled();
         usleep(250000);
     }
     $rest = stream_get_contents($pipes[1]);
@@ -1299,6 +1300,7 @@ function nexovirt_lxc_root_ssh(int $vmid): array
         // Bounded wait for boot: poll status up to ~10s.
         for ($i = 0; $i < 10; $i++) {
             sleep(1);
+            nexovirt_isolation_tick_throttled();
             $s = [];
             exec("pct status {$id} 2>&1", $s);
             if (strpos(strtolower(trim(implode("\n", $s))), 'running') !== false) {
@@ -1347,6 +1349,7 @@ function nexovirt_lxc_set_password(int $vmid, string $password): array
         exec("pct start {$id} 2>&1");
         for ($i = 0; $i < 10; $i++) {
             sleep(1);
+            nexovirt_isolation_tick_throttled();
             $s = [];
             exec("pct status {$id} 2>&1", $s);
             if (strpos(strtolower(trim(implode("\n", $s))), 'running') !== false) {
@@ -3567,6 +3570,7 @@ function nexovirt_run_cmd(string $cmd, int $timeoutSec = SCAN_CMD_TIMEOUT_SEC): 
                 $out .= $chunk;
             }
         }
+        nexovirt_isolation_tick_throttled();
         if (microtime(true) >= $deadline) {
             proc_terminate($proc, 9);
             fclose($pipes[1]);
@@ -5431,6 +5435,7 @@ function nexovirt_app_ensure_running(int $vmid): bool
     nexovirt_run_cmd("pct start {$id} 2>&1", 120);
     for ($i = 0; $i < 30; $i++) {
         sleep(1);
+        nexovirt_isolation_tick_throttled();
         if (strpos(nexovirt_run_cmd("pct status {$id} 2>&1"), 'running') !== false) {
             return true;
         }
@@ -5856,6 +5861,13 @@ function nexovirt_backup_hooks_recover(?callable $write = null, ?callable $backu
 // bridges to leave alone, e.g. SDN project VNets). The main loop re-checks it every second
 // (nexovirt_isolation_tick), because PVE recreates a guest's tap/veth on every start. Only ports the
 // agent switched on itself are listed in isolation.ports and only those are ever switched off again.
+// Fail closed (0.28.2): an isolation.json that exists but cannot be read or validated (or is missing
+// while ports are marked) never un-isolates anything; marked ports stay isolated and the heartbeat
+// reports `error`. Only an explicit valid list (`vmids` present, may be empty) switches ports off.
+// The tick runs every second while idle and, rate-limited to once per second, inside every long
+// command loop (nexovirt_run_with_ticks, nexovirt_run_cmd), the busy heartbeat and the pct boot waits.
+// ponytail: max gap = the longest single blocking exec() without a loop (proc_open missing, or a
+// plain exec() such as `pct exec` in lxc_root_ssh); add a detached reconcile loop if one grows long.
 const ISOLATION_STATE_DIR = '/var/lib/nexovirt';
 const ISOLATION_MAX_VMIDS = 5000;
 const ISOLATION_MAX_SKIP  = 64;
@@ -5946,20 +5958,36 @@ function nexovirt_isolation_desired(array $vmids, array $skip, string $netDir): 
     return $out;
 }
 
-/** In-memory state (loaded once from disk): vmids, skip, marked (port => true). */
+/**
+ * In-memory state (loaded once from disk): vmids, skip, marked (port => true), error ('' | 'unreadable'
+ * | 'missing'). An error state is re-read from disk on every call, so a repaired file takes over.
+ */
 function nexovirt_isolation_state(): array
 {
-    if (is_array($GLOBALS['nexovirt_isolation'] ?? null)) {
-        return $GLOBALS['nexovirt_isolation'];
+    $cached = $GLOBALS['nexovirt_isolation'] ?? null;
+    if (is_array($cached) && ($cached['error'] ?? '') === '') {
+        return $cached;
     }
     $dir   = nexovirt_isolation_dir();
-    $cfg   = @json_decode((string) @file_get_contents($dir . '/isolation.json'), true);
-    $v     = nexovirt_validate_isolation(is_array($cfg) ? $cfg : []);
-    $state = ['vmids' => $v['ok'] ? $v['vmids'] : [], 'skip' => $v['ok'] ? $v['skip'] : [], 'marked' => []];
+    $state = ['vmids' => [], 'skip' => [], 'marked' => [], 'error' => ''];
     foreach (explode("\n", (string) @file_get_contents($dir . '/isolation.ports')) as $p) {
         if (nexovirt_isolation_port_vmid(trim($p)) !== null) {
             $state['marked'][trim($p)] = true;
         }
+    }
+    $file = $dir . '/isolation.json';
+    if (file_exists($file)) {
+        $raw = is_file($file) ? @file_get_contents($file) : false;
+        $cfg = is_string($raw) ? json_decode($raw, true) : null;
+        $v   = is_array($cfg) && array_key_exists('vmids', $cfg) ? nexovirt_validate_isolation($cfg) : ['ok' => false];
+        if ($v['ok']) {
+            $state['vmids'] = $v['vmids'];
+            $state['skip']  = $v['skip'];
+        } else {
+            $state['error'] = 'unreadable';
+        }
+    } elseif ($state['marked'] !== []) {
+        $state['error'] = 'missing';
     }
 
     return $GLOBALS['nexovirt_isolation'] = $state;
@@ -5971,7 +5999,7 @@ function nexovirt_isolation_save_marked(array $marked): void
     @mkdir($dir, 0755, true);
     $names = array_keys($marked);
     sort($names);
-    @file_put_contents($dir . '/isolation.ports', $names === [] ? '' : implode("\n", $names) . "\n");
+    nexovirt_write_private($dir . '/isolation.ports', $names === [] ? '' : implode("\n", $names) . "\n");
 }
 
 /**
@@ -5983,10 +6011,22 @@ function nexovirt_isolation_save_marked(array $marked): void
 function nexovirt_isolation_tick(): array
 {
     $state = nexovirt_isolation_state();
+    $net   = nexovirt_isolation_net_dir();
+    if ($state['error'] !== '') {
+        // Fail closed: the desired list is unknown, so keep (or put back) isolation on every marked
+        // port and never switch one off.
+        foreach (array_keys($state['marked']) as $port) {
+            $f = "{$net}/{$port}/brport/isolated";
+            if (is_file($f) && trim((string) @file_get_contents($f)) === '0') {
+                @file_put_contents($f, '1');
+            }
+        }
+
+        return [];
+    }
     if ($state['vmids'] === [] && $state['marked'] === []) {
         return [];
     }
-    $net     = nexovirt_isolation_net_dir();
     $desired = nexovirt_isolation_desired($state['vmids'], $state['skip'], $net);
     $marked  = $state['marked'];
     foreach ($desired as $port) {
@@ -6020,12 +6060,13 @@ function nexovirt_isolation_apply(array $vmids, array $skip): array
 {
     $dir = nexovirt_isolation_dir();
     @mkdir($dir, 0755, true);
-    if (@file_put_contents($dir . '/isolation.json', nexovirt_json(['vmids' => $vmids, 'skip_bridges' => $skip])) === false) {
+    if (! nexovirt_write_private($dir . '/isolation.json', nexovirt_json(['vmids' => $vmids, 'skip_bridges' => $skip]))) {
         return ['ok' => false, 'result' => 'could not write ' . $dir . '/isolation.json'];
     }
     $state                         = nexovirt_isolation_state();
     $state['vmids']                = $vmids;
     $state['skip']                 = $skip;
+    $state['error']                = '';
     $GLOBALS['nexovirt_isolation'] = $state;
     $desired                       = nexovirt_isolation_tick();
     $net                           = nexovirt_isolation_net_dir();
@@ -6038,12 +6079,16 @@ function nexovirt_isolation_apply(array $vmids, array $skip): array
  * Heartbeat report (0.28.1): which listed guests have their bridge port isolated right now, which have a
  * port still waiting for the next tick, and which sit only on skipped (SDN project) bridges. Guests
  * without any port (stopped) are in no list. Null without isolation state (nothing to report).
+ * With `error` set (0.28.2) the agent cannot read its isolation list and keeps its marked ports isolated.
  *
- * @return array{isolated:list<int>,pending:list<int>,sdn:list<int>}|null
+ * @return array{error?:string,isolated:list<int>,pending:list<int>,sdn:list<int>}|null
  */
 function nexovirt_isolation_report(): ?array
 {
     $state = nexovirt_isolation_state();
+    if ($state['error'] !== '') {
+        return ['error' => $state['error'], 'isolated' => [], 'pending' => [], 'sdn' => []];
+    }
     if ($state['vmids'] === []) {
         return null;
     }
@@ -6079,7 +6124,22 @@ function nexovirt_sleep_with_isolation(int $seconds): void
 {
     for ($i = 0; $i < max(1, $seconds); $i++) {
         sleep(1);
+        nexovirt_isolation_tick_throttled(true);
+    }
+}
+
+/** One reconcile pass at most once per second (job and busy paths). Never throws. */
+function nexovirt_isolation_tick_throttled(bool $force = false): void
+{
+    $now = microtime(true);
+    if (! $force && $now - (float) ($GLOBALS['nexovirt_isolation_last'] ?? 0.0) < 1.0) {
+        return;
+    }
+    $GLOBALS['nexovirt_isolation_last'] = $now;
+    try {
         nexovirt_isolation_tick();
+    } catch (\Throwable $e) {
+        fwrite(STDERR, '[nexovirt-agent] isolation tick failed: ' . $e->getMessage() . PHP_EOL);
     }
 }
 
@@ -6635,6 +6695,7 @@ if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1') {
     // doesn't mark the agent stale after 300s. Any jobs in its reply are ignored (the server hands
     // none out to a busy agent anyway).
     $config['busyTick'] = static function () use ($config): void {
+        nexovirt_isolation_tick_throttled();
         $r = sendHeartbeat($config, collectStats(), [], true);
         if (! $r['ok']) {
             fwrite(STDERR, '[' . date('Y-m-d H:i:s') . "] Busy heartbeat FAILED\n");
