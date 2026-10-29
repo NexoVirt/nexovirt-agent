@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.28.2';
+const AGENT_VERSION        = '0.28.4';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -1984,10 +1984,12 @@ function nexovirt_nat_inventory(array $p): array
     if ($dry) {
         $ipt  = (string) getenv('NEXOVIRT_AGENT_FAKE_IPT_NAT');
         $nft  = (string) getenv('NEXOVIRT_AGENT_FAKE_NFT');
-        $root = (string) getenv('NEXOVIRT_AGENT_ETC_ROOT');
+        $root  = (string) getenv('NEXOVIRT_AGENT_ETC_ROOT');
+        $addrs = (string) getenv('NEXOVIRT_AGENT_FAKE_ADDRS');
     } else {
         [$ipt, $nft] = nexovirt_nat_inventory_rulesets();
-        $root = '';
+        $root  = '';
+        $addrs = nexovirt_run_cmd('ip -4 -o addr show'); // 0.28.3: networks on non-PVE interfaces (hand-made wg0)
     }
     $results = [];
     foreach ($probes as $pr) {
@@ -2002,6 +2004,7 @@ function nexovirt_nat_inventory(array $p): array
         'nft'      => nexovirt_cap_output($nft, NAT_INVENTORY_CAP),
         'sources'  => nexovirt_nat_sources($root),
         'scripts'  => nexovirt_nat_script_sources($root),
+        'addrs'    => nexovirt_cap_output($addrs, NAT_INVENTORY_CAP),
         'probes'   => $results,
     ]];
 }
@@ -3363,6 +3366,88 @@ function nexovirt_wg_disable(string $dir): void
 }
 
 /** Run a command, returning [exitCode, cappedOutput]. */
+/** Whether two IPv4 CIDRs (a bare address counts as /32) share any address. PURE. */
+function nexovirt_wg_cidrs_overlap(string $a, string $b): bool
+{
+    $parse = static function (string $c): ?array {
+        [$ip, $bits] = array_pad(explode('/', $c, 2), 2, '32');
+        $long = ip2long($ip);
+        if ($long === false || ! ctype_digit($bits) || (int) $bits > 32) {
+            return null;
+        }
+        $mask = (int) $bits === 0 ? 0 : ((0xFFFFFFFF << (32 - (int) $bits)) & 0xFFFFFFFF);
+
+        return [$long & $mask, $mask];
+    };
+    $x = $parse($a);
+    $y = $parse($b);
+    if ($x === null || $y === null) {
+        return false;
+    }
+    $mask = $x[1] & $y[1]; // the shorter prefix decides
+
+    return ($x[0] & $mask) === ($y[0] & $mask);
+}
+
+/**
+ * Hand-made node state the NexoVirt VPN would collide with (0.28.3, lab 2026-10-29: a hand-made wg0 on
+ * 10.99.0.0/24 got a second interface with the same address and route). Inputs: `ip -4 -o route show
+ * table all`, `wg show all listen-port`, `ss -Hlun`. Returns '' when clear, else one sentence for the
+ * admin (the panel shows it as is). Routes and ports of our own interface never count. PURE.
+ */
+function nexovirt_wg_conflict(string $subnet, int $port, string $routes, string $wgPorts, string $udpListen): string
+{
+    foreach (preg_split('/\R/', $routes) as $line) {
+        $tok = preg_split('/\s+/', trim($line));
+        if ($tok === false || ($tok[0] ?? '') === '') {
+            continue;
+        }
+        $i = 0;
+        if (in_array($tok[0], ['unicast', 'local', 'broadcast', 'blackhole', 'unreachable', 'prohibit', 'throw'], true)) {
+            if ($tok[0] !== 'unicast') {
+                continue; // local/broadcast entries mirror addresses; their device route is checked anyway
+            }
+            $i = 1;
+        }
+        $dest = $tok[$i] ?? '';
+        if ($dest === 'default' || $dest === '' || ! preg_match('#^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$#', $dest)) {
+            continue;
+        }
+        $devAt = array_search('dev', $tok, true);
+        $dev   = $devAt === false ? '' : (string) ($tok[$devAt + 1] ?? '');
+        if ($dev === WG_IFACE) {
+            continue;
+        }
+        if (nexovirt_wg_cidrs_overlap($dest, $subnet)) {
+            return "The VPN subnet {$subnet} overlaps {$dest}, which this node already routes via "
+                . ($dev !== '' ? $dev : 'another route') . '. Pick another VPN subnet.';
+        }
+    }
+    $ours = false;
+    foreach (preg_split('/\R/', $wgPorts) as $line) {
+        $tok = preg_split('/\s+/', trim($line));
+        if (count($tok) >= 2 && (int) $tok[1] === $port) {
+            if ($tok[0] === WG_IFACE) {
+                $ours = true;
+            } else {
+                return "UDP port {$port} is already used by the WireGuard interface {$tok[0]} on this node. Pick another VPN port.";
+            }
+        }
+    }
+    if (! $ours) {
+        foreach (preg_split('/\R/', $udpListen) as $line) {
+            $tok = preg_split('/\s+/', trim($line));
+            foreach ($tok as $t) {
+                if (preg_match('/:(\d+)$/', $t, $m) === 1 && (int) $m[1] === $port && str_contains($t, ':')) {
+                    return "UDP port {$port} is already in use on this node. Pick another VPN port.";
+                }
+            }
+        }
+    }
+
+    return '';
+}
+
 function nexovirt_wg_exec(string $cmd): array
 {
     $out  = [];
@@ -3399,6 +3484,14 @@ function nexovirt_apply_wireguard(array $p): array
     if ($dryRun) {
         return ['ok' => true, 'error' => '', 'status' => $empty,
             'conf' => nexovirt_build_wg_conf($p, str_repeat('A', 43) . '='), 'script' => $script];
+    }
+
+    $conflict = nexovirt_wg_conflict((string) $p['subnet'], (int) $p['port'],
+        (string) shell_exec('ip -4 -o route show table all 2>/dev/null'),
+        (string) shell_exec('wg show all listen-port 2>/dev/null'),
+        (string) shell_exec('ss -Hlun 2>/dev/null'));
+    if ($conflict !== '') {
+        return ['ok' => false, 'error' => 'conflict: ' . $conflict, 'status' => $empty];
     }
 
     if (trim((string) shell_exec('command -v wg 2>/dev/null')) === '') {
@@ -4795,6 +4888,29 @@ function nexovirt_dhcp_parse_listeners(string $ss): array
     return $out;
 }
 
+/**
+ * The dhcp-range / interface options of a running dnsmasq's command line (/proc/<pid>/cmdline, NUL separated)
+ * as dnsmasq.conf lines, for servers started without a config file (0.28.3, lab 2026-10-29: a hand-made
+ * `dnsmasq --interface=vmbr1 --dhcp-range=...` unit went unnoticed by the IP zone overlap warning). PURE.
+ */
+function nexovirt_dhcp_cmdline_conf(string $cmdline): string
+{
+    $args  = array_values(array_filter(explode("\0", $cmdline), static fn ($a) => $a !== ''));
+    $map   = ['--dhcp-range' => 'dhcp-range', '-F' => 'dhcp-range', '--interface' => 'interface', '-i' => 'interface'];
+    $lines = [];
+    foreach ($args as $i => $a) {
+        foreach ($map as $flag => $key) {
+            if (str_starts_with($a, $flag . '=')) {
+                $lines[] = $key . '=' . substr($a, strlen($flag) + 1);
+            } elseif ($a === $flag && isset($args[$i + 1])) {
+                $lines[] = $key . '=' . $args[$i + 1];
+            }
+        }
+    }
+
+    return implode("\n", $lines);
+}
+
 /** Readable regular config files under a directory (one level, plus one more for PVE SDN's per-zone dirs). */
 function nexovirt_dhcp_conf_files(string $dir, bool $nested): array
 {
@@ -4854,6 +4970,16 @@ function nexovirt_dhcp_read(string $root, callable $run): array
     }
     [, $ss]    = $run("ss -H -lunp 'sport = :67'");
     $listeners = array_map(static fn ($l) => $l + ['own' => isset($ownPids[$l['pid']])], nexovirt_dhcp_parse_listeners((string) $ss));
+    foreach ($listeners as $l) {
+        if ($l['own'] || $l['pid'] <= 0 || $l['process'] !== 'dnsmasq') {
+            continue;
+        }
+        $file = '/proc/' . $l['pid'] . '/cmdline';
+        $conf = nexovirt_dhcp_cmdline_conf((string) @file_get_contents($root . $file, false, null, 0, 65536));
+        if ($conf !== '') {
+            $pools = array_merge($pools, nexovirt_dhcp_parse_dnsmasq([$file => $conf]));
+        }
+    }
 
     return ['pools' => $pools, 'listeners' => $listeners];
 }
@@ -4908,6 +5034,46 @@ function nexovirt_dhcp_ensure_bin(callable $run): string
  *
  * @return array{ok:bool,result:string}
  */
+/**
+ * Whether the node's Proxmox host firewall (pve-firewall's generated PVEFW-HOST-IN, `iptables -S` output)
+ * drops guests' DHCP requests to a NexoVirt DHCP instance on $bridge: the chain ends in a drop/reject and
+ * no rule lets UDP 67 in (on that bridge or any interface). Empty chain = firewall off = false. Read only,
+ * the panel only warns (0.28.3, lab 2026-10-29: datacenter firewall policy_in DROP, guests got no lease). PURE.
+ */
+function nexovirt_dhcp_fw_blocked(string $hostIn, string $bridge): bool
+{
+    $lines = array_values(array_filter(array_map('trim', preg_split('/\R/', $hostIn) ?: []), static fn ($l) => str_starts_with($l, '-A PVEFW-HOST-IN ')));
+    if ($lines === []) {
+        return false;
+    }
+    $drops = false;
+    foreach ($lines as $l) {
+        if (preg_match('/\s-j (DROP|REJECT|PVEFW-Drop|PVEFW-Reject)\b/', $l) === 1 && ! str_contains($l, ' -p ') && ! str_contains($l, '--ctstate')) {
+            $drops = true;
+        }
+        if (preg_match('/\s-j (RETURN|ACCEPT)\b/', $l) !== 1 || ! str_contains($l, '-p udp')) {
+            continue;
+        }
+        if (preg_match('/ -i (\S+)/', $l, $m) === 1 && $m[1] !== $bridge && ! (str_ends_with($m[1], '+') && str_starts_with($bridge, rtrim($m[1], '+')))) {
+            continue;
+        }
+        if (str_contains($l, ' -s ') || str_contains($l, '--match-set')) {
+            continue; // limited to a source: a DHCP request comes from 0.0.0.0
+        }
+        if (preg_match('/--dports? (\S+)/', $l, $m) !== 1) {
+            return false; // every UDP port
+        }
+        foreach (explode(',', $m[1]) as $part) {
+            [$lo, $hi] = array_pad(explode(':', $part, 2), 2, null);
+            if ((int) $lo <= 67 && 67 <= (int) ($hi ?? $lo)) {
+                return false;
+            }
+        }
+    }
+
+    return $drops;
+}
+
 function nexovirt_apply_dhcp(array $p, string $root, callable $run): array
 {
     $v = nexovirt_dhcp_validate($p);
@@ -4985,7 +5151,9 @@ function nexovirt_apply_dhcp(array $p, string $root, callable $run): array
             }
         }
         $ok       = $ok && $err === '';
-        $states[] = ['bridge' => $inst['bridge'], 'state' => $err === '' ? 'active' : 'failed', 'error' => nexovirt_cap_output($err, 2000), 'reserved' => count($macs), 'skipped' => $skipped];
+        [, $hostIn] = $run('iptables -S PVEFW-HOST-IN');
+        $states[] = ['bridge' => $inst['bridge'], 'state' => $err === '' ? 'active' : 'failed', 'error' => nexovirt_cap_output($err, 2000), 'reserved' => count($macs), 'skipped' => $skipped,
+            'fw_blocked' => $err === '' && nexovirt_dhcp_fw_blocked((string) $hostIn, $inst['bridge'])];
     }
     if ($v['instances'] === []) {
         @unlink($root . DHCP_UNIT_PATH);
@@ -6025,6 +6193,7 @@ function nexovirt_isolation_tick(): array
         return [];
     }
     if ($state['vmids'] === [] && $state['marked'] === []) {
+        nexovirt_arp_filter_sync([]);
         return [];
     }
     $desired = nexovirt_isolation_desired($state['vmids'], $state['skip'], $net);
@@ -6051,8 +6220,129 @@ function nexovirt_isolation_tick(): array
     }
     $state['marked']               = $marked;
     $GLOBALS['nexovirt_isolation'] = $state;
+    nexovirt_arp_filter_sync($desired);
 
     return $desired;
+}
+
+// ── ARP filter for isolated guests (0.28.4) ─────────────────────────────────────────────────────────
+// Port isolation and the guest firewall block IP, but ARP still reached the uplink and non-isolated ports, so
+// `arp-scan --localnet` in an isolated guest listed every LAN device behind the uplink (customer report
+// 2026-10-29). For every isolated port whose NIC has a static IPv4 + gateway, NexoVirt's OWN nft table
+// `bridge nexovirt_arp` drops ARP requests that ask for anything but the gateway or the guest's own address,
+// and ARP replies that claim another address. Only that table is ever created or deleted (pve-firewall's
+// ebtables/nft tables are never touched); NICs without a static address (DHCP) are not filtered. IPv4 only.
+
+const ARP_TABLE = 'nexovirt_arp';
+
+/** The PVE config of a local guest, current section only ('' when missing). */
+function nexovirt_guest_conf(string $type, int $vmid): string
+{
+    $root = getenv('NEXOVIRT_AGENT_PVE_ETC');
+    $dir  = (is_string($root) && $root !== '' ? rtrim($root, '/') : '/etc/pve') . ($type === 'lxc' ? '/lxc' : '/qemu-server');
+    $raw  = (string) @file_get_contents("{$dir}/{$vmid}.conf");
+
+    return (string) preg_split('/^\[/m', $raw, 2)[0];
+}
+
+/**
+ * Static IPv4 + gateway of one guest NIC from its config: ['ips' => [...], 'gw' => '...'] or null (DHCP/none). PURE.
+ */
+function nexovirt_arp_nic(string $conf, string $type, int $idx): ?array
+{
+    $line = '';
+    $key  = $type === 'lxc' ? "net{$idx}" : "ipconfig{$idx}";
+    if (preg_match('/^' . $key . ':\s*(.+)$/m', $conf, $m) === 1) {
+        $line = trim($m[1]);
+    }
+    $kv = [];
+    foreach (explode(',', $line) as $tok) {
+        [$k, $v] = array_pad(explode('=', $tok, 2), 2, '');
+        $kv[trim($k)] = trim($v);
+    }
+    $ip = explode('/', (string) ($kv['ip'] ?? ''))[0];
+    $gw = (string) ($kv['gw'] ?? '');
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false || filter_var($gw, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+        return null;
+    }
+
+    return ['ips' => [$ip], 'gw' => $gw];
+}
+
+/**
+ * nft script for the isolated ports ('' = no rule: the table goes). $conf(type, vmid) returns a guest config. PURE.
+ *
+ * @param list<string> $ports
+ */
+function nexovirt_arp_ruleset(array $ports, callable $conf): string
+{
+    $rules = [];
+    foreach ($ports as $port) {
+        if (preg_match('/^(tap|veth|fwpr)(\d+)(?:i|p)(\d+)$/', $port, $m) !== 1) {
+            continue;
+        }
+        $vmid  = (int) $m[2];
+        $types = $m[1] === 'tap' ? ['qemu'] : ($m[1] === 'veth' ? ['lxc'] : ['lxc', 'qemu']);
+        $nic   = null;
+        foreach ($types as $t) {
+            $c = (string) $conf($t, $vmid);
+            if ($c !== '') {
+                $nic = nexovirt_arp_nic($c, $t, (int) $m[3]);
+                break;
+            }
+        }
+        if ($nic === null) {
+            continue;
+        }
+        $allow   = implode(', ', array_values(array_unique(array_merge([$nic['gw']], $nic['ips']))));
+        $own     = implode(', ', $nic['ips']);
+        $rules[] = "\t\tiifname \"{$port}\" ether type arp arp operation request arp daddr ip != { {$allow} } drop";
+        $rules[] = "\t\tiifname \"{$port}\" ether type arp arp operation reply arp saddr ip != { {$own} } drop";
+    }
+    if ($rules === []) {
+        return '';
+    }
+
+    return 'table bridge ' . ARP_TABLE . "\ndelete table bridge " . ARP_TABLE . "\ntable bridge " . ARP_TABLE . " {\n\tchain pre {\n"
+        . "\t\ttype filter hook prerouting priority -300; policy accept;\n" . implode("\n", $rules) . "\n\t}\n}\n";
+}
+
+/** Apply the ARP filter for the desired isolated ports when it changed (or vanished). Never throws. */
+function nexovirt_arp_filter_sync(array $desired): void
+{
+    try {
+        if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1' || ! nexovirt_bin_installed('nft')) {
+            return;
+        }
+        $script = nexovirt_arp_ruleset($desired, 'nexovirt_guest_conf');
+        $last   = $GLOBALS['nexovirt_arp_last'] ?? null;
+        $check  = time() - (int) ($GLOBALS['nexovirt_arp_checked'] ?? 0) >= 30;
+        if ($script === $last && ! $check) {
+            return;
+        }
+        $GLOBALS['nexovirt_arp_checked'] = time();
+        $exists = nexovirt_run_cmd('nft list table bridge ' . ARP_TABLE . ' 2>/dev/null') !== '';
+        if ($script === $last && ($script === '') !== $exists) {
+            return; // still as applied
+        }
+        if ($script === '') {
+            if ($exists) {
+                exec('nft delete table bridge ' . ARP_TABLE . ' 2>&1');
+            }
+        } else {
+            $tmp = tempnam(sys_get_temp_dir(), 'nxarp');
+            file_put_contents($tmp, $script);
+            exec('nft -f ' . escapeshellarg($tmp) . ' 2>&1', $out, $code);
+            @unlink($tmp);
+            if ($code !== 0) {
+                fwrite(STDERR, '[nexovirt-agent] ARP filter not applied: ' . implode(' ', $out) . PHP_EOL);
+                return;
+            }
+        }
+        $GLOBALS['nexovirt_arp_last'] = $script;
+    } catch (\Throwable $e) {
+        fwrite(STDERR, '[nexovirt-agent] ARP filter failed: ' . $e->getMessage() . PHP_EOL);
+    }
 }
 
 /** bridge_isolation_apply: store the desired set, reconcile at once, report the isolated ports. */
