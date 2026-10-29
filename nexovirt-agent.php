@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.27.1';
+const AGENT_VERSION        = '0.28.1';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -159,6 +159,16 @@ function collectStats(): array
         }
     } catch (\Throwable $e) {
         fwrite(STDERR, '[nexovirt-agent] image report failed: ' . $e->getMessage() . PHP_EOL);
+    }
+
+    // Port isolation report (0.28.1): the panel's per-guest "Active on the node" status comes from here.
+    try {
+        $iso = nexovirt_isolation_report();
+        if ($iso !== null) {
+            $stats['isolation'] = $iso;
+        }
+    } catch (\Throwable $e) {
+        fwrite(STDERR, '[nexovirt-agent] isolation report failed: ' . $e->getMessage() . PHP_EOL);
     }
 
     return $stats;
@@ -5841,6 +5851,238 @@ function nexovirt_backup_hooks_recover(?callable $write = null, ?callable $backu
     }
 }
 
+// ── Guest network isolation (L2): `isolated on` for the bridge ports of isolated guests ──────────
+// The panel sends the full desired set (bridge_isolation_apply: guest vmids of this connection plus
+// bridges to leave alone, e.g. SDN project VNets). The main loop re-checks it every second
+// (nexovirt_isolation_tick), because PVE recreates a guest's tap/veth on every start. Only ports the
+// agent switched on itself are listed in isolation.ports and only those are ever switched off again.
+const ISOLATION_STATE_DIR = '/var/lib/nexovirt';
+const ISOLATION_MAX_VMIDS = 5000;
+const ISOLATION_MAX_SKIP  = 64;
+
+function nexovirt_isolation_net_dir(): string
+{
+    $d = getenv('NEXOVIRT_AGENT_SYSFS_NET');
+
+    return is_string($d) && $d !== '' ? rtrim($d, '/') : '/sys/class/net';
+}
+
+function nexovirt_isolation_dir(): string
+{
+    $d = getenv('NEXOVIRT_AGENT_ISOLATION_DIR');
+
+    return is_string($d) && $d !== '' ? rtrim($d, '/') : ISOLATION_STATE_DIR;
+}
+
+/** @return array{ok:bool,error:string,vmids:list<int>,skip:list<string>} */
+function nexovirt_validate_isolation(array $p): array
+{
+    $bad = static fn (string $e): array => ['ok' => false, 'error' => $e, 'vmids' => [], 'skip' => []];
+    $vm  = $p['vmids'] ?? [];
+    $sk  = $p['skip_bridges'] ?? [];
+    if (! is_array($vm) || count($vm) > ISOLATION_MAX_VMIDS) {
+        return $bad('vmids');
+    }
+    if (! is_array($sk) || count($sk) > ISOLATION_MAX_SKIP) {
+        return $bad('skip_bridges');
+    }
+    $vmids = [];
+    foreach ($vm as $v) {
+        $s = is_int($v) ? (string) $v : (is_string($v) ? $v : '');
+        if (preg_match('/^[1-9]\d{2,8}$/', $s) !== 1) {
+            return $bad('vmid');
+        }
+        $vmids[(int) $s] = (int) $s;
+    }
+    $skip = [];
+    foreach ($sk as $b) {
+        if (! is_string($b) || preg_match('/^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$/', $b) !== 1) {
+            return $bad('bridge');
+        }
+        $skip[$b] = $b;
+    }
+    ksort($vmids);
+    sort($skip);
+
+    return ['ok' => true, 'error' => '', 'vmids' => array_values($vmids), 'skip' => array_values($skip)];
+}
+
+/** The vmid of a guest bridge port name (tap<vmid>i<n>, veth<vmid>i<n>, fwpr<vmid>p<n>), else null. */
+function nexovirt_isolation_port_vmid(string $name): ?int
+{
+    return preg_match('/^(?:tap(\d+)i\d+|veth(\d+)i\d+|fwpr(\d+)p\d+)$/', $name, $m) === 1
+        ? (int) ($m[1] !== '' ? $m[1] : ($m[2] !== '' ? $m[2] : $m[3]))
+        : null;
+}
+
+/**
+ * The bridge ports that should be isolated: ports of the listed guests whose master is a bridge
+ * that is neither a PVE firewall bridge (fwbr*: the vmbr side is fwpr*) nor skipped.
+ *
+ * @return list<string>
+ */
+function nexovirt_isolation_desired(array $vmids, array $skip, string $netDir): array
+{
+    if ($vmids === []) {
+        return [];
+    }
+    $want = array_flip($vmids);
+    $out  = [];
+    foreach ((array) @scandir($netDir) as $name) {
+        $name = (string) $name;
+        $vmid = nexovirt_isolation_port_vmid($name);
+        if ($vmid === null || ! isset($want[$vmid]) || ! is_file("{$netDir}/{$name}/brport/isolated")) {
+            continue;
+        }
+        $link   = @readlink("{$netDir}/{$name}/master");
+        $master = is_string($link) ? basename($link) : '';
+        if ($master === '' || str_starts_with($master, 'fwbr') || in_array($master, $skip, true)) {
+            continue;
+        }
+        $out[] = $name;
+    }
+    sort($out);
+
+    return $out;
+}
+
+/** In-memory state (loaded once from disk): vmids, skip, marked (port => true). */
+function nexovirt_isolation_state(): array
+{
+    if (is_array($GLOBALS['nexovirt_isolation'] ?? null)) {
+        return $GLOBALS['nexovirt_isolation'];
+    }
+    $dir   = nexovirt_isolation_dir();
+    $cfg   = @json_decode((string) @file_get_contents($dir . '/isolation.json'), true);
+    $v     = nexovirt_validate_isolation(is_array($cfg) ? $cfg : []);
+    $state = ['vmids' => $v['ok'] ? $v['vmids'] : [], 'skip' => $v['ok'] ? $v['skip'] : [], 'marked' => []];
+    foreach (explode("\n", (string) @file_get_contents($dir . '/isolation.ports')) as $p) {
+        if (nexovirt_isolation_port_vmid(trim($p)) !== null) {
+            $state['marked'][trim($p)] = true;
+        }
+    }
+
+    return $GLOBALS['nexovirt_isolation'] = $state;
+}
+
+function nexovirt_isolation_save_marked(array $marked): void
+{
+    $dir = nexovirt_isolation_dir();
+    @mkdir($dir, 0755, true);
+    $names = array_keys($marked);
+    sort($names);
+    @file_put_contents($dir . '/isolation.ports', $names === [] ? '' : implode("\n", $names) . "\n");
+}
+
+/**
+ * One reconcile pass: switch isolation on for desired ports that lost it (recreated tap) and off for
+ * ports the agent marked that are no longer desired. Returns the desired ports. Cheap no-op without state.
+ *
+ * @return list<string>
+ */
+function nexovirt_isolation_tick(): array
+{
+    $state = nexovirt_isolation_state();
+    if ($state['vmids'] === [] && $state['marked'] === []) {
+        return [];
+    }
+    $net     = nexovirt_isolation_net_dir();
+    $desired = nexovirt_isolation_desired($state['vmids'], $state['skip'], $net);
+    $marked  = $state['marked'];
+    foreach ($desired as $port) {
+        $f = "{$net}/{$port}/brport/isolated";
+        if (trim((string) @file_get_contents($f)) === '0' && @file_put_contents($f, '1') !== false) {
+            $marked[$port] = true;
+        }
+    }
+    $keep = array_flip($desired);
+    foreach (array_keys($marked) as $port) {
+        if (isset($keep[$port])) {
+            continue;
+        }
+        $f = "{$net}/{$port}/brport/isolated";
+        if (is_file($f) && trim((string) @file_get_contents($f)) === '1' && @file_put_contents($f, '0') === false) {
+            continue; // retry next pass
+        }
+        unset($marked[$port]);
+    }
+    if ($marked !== $state['marked']) {
+        nexovirt_isolation_save_marked($marked);
+    }
+    $state['marked']               = $marked;
+    $GLOBALS['nexovirt_isolation'] = $state;
+
+    return $desired;
+}
+
+/** bridge_isolation_apply: store the desired set, reconcile at once, report the isolated ports. */
+function nexovirt_isolation_apply(array $vmids, array $skip): array
+{
+    $dir = nexovirt_isolation_dir();
+    @mkdir($dir, 0755, true);
+    if (@file_put_contents($dir . '/isolation.json', nexovirt_json(['vmids' => $vmids, 'skip_bridges' => $skip])) === false) {
+        return ['ok' => false, 'result' => 'could not write ' . $dir . '/isolation.json'];
+    }
+    $state                         = nexovirt_isolation_state();
+    $state['vmids']                = $vmids;
+    $state['skip']                 = $skip;
+    $GLOBALS['nexovirt_isolation'] = $state;
+    $desired                       = nexovirt_isolation_tick();
+    $net                           = nexovirt_isolation_net_dir();
+    $on                            = array_values(array_filter($desired, static fn ($p) => trim((string) @file_get_contents("{$net}/{$p}/brport/isolated")) === '1'));
+
+    return ['ok' => true, 'result' => nexovirt_json(['isolated' => $on, 'not_isolated' => array_values(array_diff($desired, $on)), 'vmids' => count($vmids)])];
+}
+
+/**
+ * Heartbeat report (0.28.1): which listed guests have their bridge port isolated right now, which have a
+ * port still waiting for the next tick, and which sit only on skipped (SDN project) bridges. Guests
+ * without any port (stopped) are in no list. Null without isolation state (nothing to report).
+ *
+ * @return array{isolated:list<int>,pending:list<int>,sdn:list<int>}|null
+ */
+function nexovirt_isolation_report(): ?array
+{
+    $state = nexovirt_isolation_state();
+    if ($state['vmids'] === []) {
+        return null;
+    }
+    $net  = nexovirt_isolation_net_dir();
+    $want = array_flip($state['vmids']);
+    $out  = ['isolated' => [], 'pending' => [], 'sdn' => []];
+    foreach (nexovirt_isolation_desired($state['vmids'], $state['skip'], $net) as $port) {
+        $vmid = (int) nexovirt_isolation_port_vmid($port);
+        $key  = trim((string) @file_get_contents("{$net}/{$port}/brport/isolated")) === '1' ? 'isolated' : 'pending';
+        $out[$key][$vmid] = $vmid;
+    }
+    foreach ((array) @scandir($net) as $name) {
+        $vmid = nexovirt_isolation_port_vmid((string) $name);
+        if ($vmid === null || ! isset($want[$vmid]) || isset($out['isolated'][$vmid]) || isset($out['pending'][$vmid])) {
+            continue;
+        }
+        $link = @readlink("{$net}/{$name}/master");
+        if (is_string($link) && in_array(basename($link), $state['skip'], true)) {
+            $out['sdn'][$vmid] = $vmid;
+        }
+    }
+    foreach ($out as $k => $v) {
+        sort($v);
+        $out[$k] = array_values($v);
+    }
+    $out['isolated'] = array_values(array_diff($out['isolated'], $out['pending']));
+
+    return $out;
+}
+
+/** Sleep $seconds in 1 s steps, keeping port isolation current in between. */
+function nexovirt_sleep_with_isolation(int $seconds): void
+{
+    for ($i = 0; $i < max(1, $seconds); $i++) {
+        sleep(1);
+        nexovirt_isolation_tick();
+    }
+}
+
 /**
  * Execute one job. Returns ['id'=>int, 'ok'=>bool, 'result'=>string].
  * Allowlisted job types only (`write_snippet`, `ensure_storage`, `download_image`,
@@ -5980,6 +6222,15 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
     if ($type === 'ensure_sdn_egress') {
         // No parameters. Enables + persists IPv4 forwarding so a SNAT SDN subnet can route to the WAN.
         $r = nexovirt_ensure_sdn_egress();
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
+    if ($type === 'bridge_isolation_apply') {
+        $v = nexovirt_validate_isolation($p);
+        if (! $v['ok']) {
+            return ['id' => $id, 'ok' => false, 'result' => 'invalid bridge_isolation_apply payload: ' . $v['error']];
+        }
+        $r = nexovirt_isolation_apply($v['vmids'], $v['skip']);
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
@@ -6442,7 +6693,7 @@ if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1') {
         }
 
         if (! $once) {
-            sleep($hadJobs ? 3 : $config['interval']);
+            nexovirt_sleep_with_isolation($hadJobs ? 3 : (int) $config['interval']);
         }
     } while (! $once);
 }
