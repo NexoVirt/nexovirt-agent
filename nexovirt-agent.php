@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.28.5';
+const AGENT_VERSION        = '0.29.1';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -6038,6 +6038,7 @@ function nexovirt_backup_hooks_recover(?callable $write = null, ?callable $backu
 // plain exec() such as `pct exec` in lxc_root_ssh); add a detached reconcile loop if one grows long.
 const ISOLATION_STATE_DIR = '/var/lib/nexovirt';
 const ISOLATION_MAX_VMIDS = 5000;
+const ISOLATION_MAX_ALLOW = 32;
 const ISOLATION_MAX_SKIP  = 64;
 
 function nexovirt_isolation_net_dir(): string
@@ -6057,7 +6058,7 @@ function nexovirt_isolation_dir(): string
 /** @return array{ok:bool,error:string,vmids:list<int>,skip:list<string>} */
 function nexovirt_validate_isolation(array $p): array
 {
-    $bad = static fn (string $e): array => ['ok' => false, 'error' => $e, 'vmids' => [], 'skip' => []];
+    $bad = static fn (string $e): array => ['ok' => false, 'error' => $e, 'vmids' => [], 'skip' => [], 'allow' => []];
     $vm  = $p['vmids'] ?? [];
     $sk  = $p['skip_bridges'] ?? [];
     if (! is_array($vm) || count($vm) > ISOLATION_MAX_VMIDS) {
@@ -6083,8 +6084,47 @@ function nexovirt_validate_isolation(array $p): array
     }
     ksort($vmids);
     sort($skip);
+    // Allowlist (0.29.1): per isolated guest, the IPv4 addresses/networks its ARP requests may ask for.
+    $al    = $p['allow'] ?? [];
+    $allow = [];
+    if (! is_array($al) || count($al) > ISOLATION_MAX_VMIDS) {
+        return $bad('allow');
+    }
+    foreach ($al as $vmid => $list) {
+        if (preg_match('/^[1-9]\d{2,8}$/', (string) $vmid) !== 1 || ! isset($vmids[(int) $vmid]) || ! is_array($list) || count($list) > ISOLATION_MAX_ALLOW) {
+            return $bad('allow');
+        }
+        $out = [];
+        foreach ($list as $c) {
+            $n = is_string($c) ? nexovirt_isolation_v4_net($c) : null;
+            if ($n === null) {
+                return $bad('allow entry');
+            }
+            $out[$n] = $n;
+        }
+        if ($out !== []) {
+            sort($out);
+            $allow[(int) $vmid] = array_values($out);
+        }
+    }
+    ksort($allow);
 
-    return ['ok' => true, 'error' => '', 'vmids' => array_values($vmids), 'skip' => array_values($skip)];
+    return ['ok' => true, 'error' => '', 'vmids' => array_values($vmids), 'skip' => array_values($skip), 'allow' => $allow];
+}
+
+/** An IPv4 address or network (/8../32), network-aligned, or null. PURE. */
+function nexovirt_isolation_v4_net(string $c): ?string
+{
+    if (preg_match('#^(\d{1,3}(?:\.\d{1,3}){3})(?:/(\d{1,2}))?$#', $c, $m) !== 1 || filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+        return null;
+    }
+    $len = isset($m[2]) && $m[2] !== '' ? (int) $m[2] : 32;
+    if ($len < 8 || $len > 32) {
+        return null;
+    }
+    $net = long2ip(ip2long($m[1]) & ((0xFFFFFFFF << (32 - $len)) & 0xFFFFFFFF));
+
+    return $len === 32 ? $net : $net . '/' . $len;
 }
 
 /** The vmid of a guest bridge port name (tap<vmid>i<n>, veth<vmid>i<n>, fwpr<vmid>p<n>), else null. */
@@ -6137,7 +6177,7 @@ function nexovirt_isolation_state(): array
         return $cached;
     }
     $dir   = nexovirt_isolation_dir();
-    $state = ['vmids' => [], 'skip' => [], 'marked' => [], 'error' => ''];
+    $state = ['vmids' => [], 'skip' => [], 'allow' => [], 'marked' => [], 'error' => ''];
     foreach (explode("\n", (string) @file_get_contents($dir . '/isolation.ports')) as $p) {
         if (nexovirt_isolation_port_vmid(trim($p)) !== null) {
             $state['marked'][trim($p)] = true;
@@ -6151,6 +6191,7 @@ function nexovirt_isolation_state(): array
         if ($v['ok']) {
             $state['vmids'] = $v['vmids'];
             $state['skip']  = $v['skip'];
+            $state['allow'] = $v['allow'];
         } else {
             $state['error'] = 'unreadable';
         }
@@ -6220,7 +6261,7 @@ function nexovirt_isolation_tick(): array
     }
     $state['marked']               = $marked;
     $GLOBALS['nexovirt_isolation'] = $state;
-    nexovirt_arp_filter_sync($desired);
+    nexovirt_arp_filter_sync($desired, null, null, $state['allow'] ?? []);
 
     return $desired;
 }
@@ -6296,7 +6337,7 @@ function nexovirt_arp_trunks(string $conf, int $idx): array
  *
  * @param list<string> $ports
  */
-function nexovirt_arp_ruleset(array $ports, callable $conf): string
+function nexovirt_arp_ruleset(array $ports, callable $conf, array $allowMap = []): string
 {
     $rules = [];
     foreach ($ports as $port) {
@@ -6334,7 +6375,8 @@ function nexovirt_arp_ruleset(array $ports, callable $conf): string
         if ($nic === null) {
             continue;
         }
-        $allow = implode(', ', array_values(array_unique(array_merge([$nic['gw']], $nic['ips']))));
+        // Allowlisted peers (0.29.1): the guest may also ask for these addresses/networks.
+        $allow = implode(', ', array_values(array_unique(array_merge([$nic['gw']], $nic['ips'], (array) ($allowMap[$vmid] ?? [])))));
         $own   = implode(', ', array_merge(['0.0.0.0'], $nic['ips']));
         $match = $trunks === [] ? ['ether type arp '] : ['ether type arp ', 'ether type 8021q vlan type arp '];
         foreach ($match as $mt) {
@@ -6367,7 +6409,7 @@ function nexovirt_arp_exec(string $cmd): array
  * Apply the ARP filter for the desired isolated ports when it changed (or vanished). Never throws.
  * $run / $conf are test seams (a given $run skips the DRYRUN and nft checks).
  */
-function nexovirt_arp_filter_sync(array $desired, ?callable $run = null, ?callable $conf = null): void
+function nexovirt_arp_filter_sync(array $desired, ?callable $run = null, ?callable $conf = null, array $allow = []): void
 {
     try {
         if ($run === null) {
@@ -6376,7 +6418,7 @@ function nexovirt_arp_filter_sync(array $desired, ?callable $run = null, ?callab
             }
             $run = 'nexovirt_arp_exec';
         }
-        $script = nexovirt_arp_ruleset($desired, $conf ?? 'nexovirt_guest_conf');
+        $script = nexovirt_arp_ruleset($desired, $conf ?? 'nexovirt_guest_conf', $allow);
         $last   = $GLOBALS['nexovirt_arp_last'] ?? null;
         $check  = time() - (int) ($GLOBALS['nexovirt_arp_checked'] ?? 0) >= 30;
         if ($script === $last && ! $check) {
@@ -6409,16 +6451,17 @@ function nexovirt_arp_filter_sync(array $desired, ?callable $run = null, ?callab
 }
 
 /** bridge_isolation_apply: store the desired set, reconcile at once, report the isolated ports. */
-function nexovirt_isolation_apply(array $vmids, array $skip): array
+function nexovirt_isolation_apply(array $vmids, array $skip, array $allow = []): array
 {
     $dir = nexovirt_isolation_dir();
     @mkdir($dir, 0755, true);
-    if (! nexovirt_write_private($dir . '/isolation.json', nexovirt_json(['vmids' => $vmids, 'skip_bridges' => $skip]))) {
+    if (! nexovirt_write_private($dir . '/isolation.json', nexovirt_json(['vmids' => $vmids, 'skip_bridges' => $skip] + ($allow !== [] ? ['allow' => $allow] : [])))) {
         return ['ok' => false, 'result' => 'could not write ' . $dir . '/isolation.json'];
     }
     $state                         = nexovirt_isolation_state();
     $state['vmids']                = $vmids;
     $state['skip']                 = $skip;
+    $state['allow']                = $allow;
     $state['error']                = '';
     $GLOBALS['nexovirt_isolation'] = $state;
     $desired                       = nexovirt_isolation_tick();
@@ -6494,6 +6537,209 @@ function nexovirt_isolation_tick_throttled(bool $force = false): void
     } catch (\Throwable $e) {
         fwrite(STDERR, '[nexovirt-agent] isolation tick failed: ' . $e->getMessage() . PHP_EOL);
     }
+}
+
+// ---------------------------------------------------------------------------
+// update_url (0.29.0): move the agent to a new panel address. The panel can only reach the agent
+// through the heartbeat reply, so an agent onboarded on http://<ip> keeps that address forever unless
+// the panel tells it. Fail closed: https + a plain hostname from the job's own allow list, then a
+// test heartbeat (no redirects) that must echo this job's nonce + agent id before the conf changes.
+// ---------------------------------------------------------------------------
+
+/** Max entries in allowed_url_hosts. */
+const UPDATE_URL_MAX_HOSTS = 10;
+
+/** A plain DNS hostname (no IP literal, no trailing dot), lowercase. PURE. */
+function nexovirt_valid_url_hostname(string $h): bool
+{
+    if ($h === '' || strlen($h) > 253 || filter_var($h, FILTER_VALIDATE_IP) !== false) {
+        return false;
+    }
+    if (preg_match('/^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/D', $h) !== 1) {
+        return false;
+    }
+    // The last label must not be all digits (rules out dotted-decimal and odd IPv4 spellings).
+    return preg_match('/\.[0-9]+$/D', $h) !== 1;
+}
+
+/**
+ * Validate an update_url target. Only https://<hostname>[:port][/] with the hostname in $allowed.
+ * PURE. @return array{ok:bool, url:string, error:string} url = normalized, no trailing slash.
+ */
+function nexovirt_validate_update_url(mixed $url, mixed $allowed): array
+{
+    $bad = static fn (string $e): array => ['ok' => false, 'url' => '', 'error' => $e];
+    if (! is_string($url) || $url === '' || strlen($url) > 300) {
+        return $bad('missing url');
+    }
+    if (! is_array($allowed) || $allowed === [] || count($allowed) > UPDATE_URL_MAX_HOSTS) {
+        return $bad('missing allowed_url_hosts');
+    }
+    $hosts = [];
+    foreach ($allowed as $h) {
+        if (! is_string($h) || ! nexovirt_valid_url_hostname(strtolower($h))) {
+            return $bad('invalid allowed_url_hosts entry');
+        }
+        $hosts[] = strtolower($h);
+    }
+    if (preg_match('#^http://#i', $url) === 1) {
+        return $bad('only https:// URLs are accepted');
+    }
+    // No userinfo, query, fragment, path (other than "/"), whitespace or IPv6 literal: the class excludes @ [ ] ? #.
+    if (preg_match('#^https://([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?/?$#D', $url, $m) !== 1) {
+        return $bad('URL must be https://<hostname>[:port]/ without user, path or query');
+    }
+    $host = strtolower($m[1]);
+    if (! nexovirt_valid_url_hostname($host)) {
+        return $bad('URL host must be a hostname, not an IP address');
+    }
+    if (! in_array($host, $hosts, true)) {
+        return $bad('URL host is not one of the panel hostnames');
+    }
+    $port = isset($m[2]) && $m[2] !== '' ? (int) $m[2] : 0;
+    if (isset($m[2]) && $m[2] !== '' && ($port < 1 || $port > 65535)) {
+        return $bad('invalid port');
+    }
+
+    return ['ok' => true, 'url' => 'https://' . $host . ($port > 0 && $port !== 443 ? ':' . $port : ''), 'error' => ''];
+}
+
+/** The conf file that holds NEXOVIRT_URL (same lookup order as loadConfig). */
+function nexovirt_agent_conf_path(): string
+{
+    foreach ([__DIR__ . '/nexovirt-agent.conf', '/etc/nexovirt-agent.conf'] as $f) {
+        $raw = is_file($f) ? @file_get_contents($f) : false;
+        if (is_string($raw) && preg_match('/^\s*NEXOVIRT_URL=/m', $raw) === 1) {
+            return $f;
+        }
+    }
+
+    return '/etc/nexovirt-agent.conf';
+}
+
+/**
+ * New conf text: NEXOVIRT_URL replaced (or added), the http opt-in dropped (the new URL is https). PURE.
+ */
+function nexovirt_conf_with_url(string $conf, string $url): string
+{
+    $out  = [];
+    $done = false;
+    foreach (preg_split('/\r?\n/', $conf) as $line) {
+        $t = trim($line);
+        if (str_starts_with($t, 'NEXOVIRT_URL=')) {
+            if (! $done) {
+                $out[] = 'NEXOVIRT_URL=' . $url;
+                $done  = true;
+            }
+            continue;
+        }
+        if (str_starts_with($t, 'NEXOVIRT_ALLOW_INSECURE=')) {
+            continue;
+        }
+        $out[] = $line;
+    }
+    while ($out !== [] && end($out) === '') {
+        array_pop($out);
+    }
+    if (! $done) {
+        array_unshift($out, 'NEXOVIRT_URL=' . $url);
+    }
+
+    return implode("\n", $out) . "\n";
+}
+
+/** Atomically rewrite NEXOVIRT_URL in $path (tmp + rename in the same dir, mode + owner kept). */
+function nexovirt_conf_write_url(string $path, string $url): bool
+{
+    $raw = is_file($path) ? @file_get_contents($path) : false;
+    if (! is_string($raw)) {
+        return false;
+    }
+    $mode = @fileperms($path);
+    $uid  = @fileowner($path);
+    $gid  = @filegroup($path);
+    $tmp  = $path . '.nxtmp';
+    $old  = umask(0077);
+    try {
+        if (@file_put_contents($tmp, nexovirt_conf_with_url($raw, $url), LOCK_EX) === false) {
+            return false;
+        }
+        @chmod($tmp, $mode !== false ? ($mode & 0777) : 0600);
+        if ($uid !== false) {
+            @chown($tmp, $uid);
+        }
+        if ($gid !== false) {
+            @chgrp($tmp, $gid);
+        }
+        if (! @rename($tmp, $path)) {
+            @unlink($tmp);
+            return false;
+        }
+
+        return true;
+    } finally {
+        umask($old);
+    }
+}
+
+/** Default probe sender: the same transport as the heartbeat (neither follows redirects). */
+function nexovirt_probe_send(string $endpoint, string $token, string $payload, ?string $caBundle): array
+{
+    return extension_loaded('curl')
+        ? sendWithCurl($endpoint, $token, $payload, $caBundle)
+        : sendWithStream($endpoint, $token, $payload, $caBundle);
+}
+
+/**
+ * Run an update_url job. $send(endpoint, token, payload, caBundle) => {ok, status, body} (test seam),
+ * $confPath = the conf to rewrite (test seam). Result JSON: {old_url, new_url, result, reason}.
+ *
+ * @return array{ok:bool, result:string, url:string}
+ */
+function nexovirt_update_url(array $p, array $config, ?callable $send = null, ?string $confPath = null): array
+{
+    $old  = (string) ($config['url'] ?? '');
+    $out  = static fn (bool $ok, string $new, string $reason): array => [
+        'ok'     => $ok,
+        'url'    => $ok ? $new : '',
+        'result' => nexovirt_json(['old_url' => $old, 'new_url' => $new, 'result' => $ok ? 'moved' : 'kept', 'reason' => $reason]),
+    ];
+    $v = nexovirt_validate_update_url($p['url'] ?? null, $p['allowed_url_hosts'] ?? null);
+    $raw = is_string($p['url'] ?? null) ? substr((string) $p['url'], 0, 300) : '';
+    if (! $v['ok']) {
+        return $out(false, $raw, $v['error']);
+    }
+    $nonce   = $p['nonce'] ?? null;
+    $agentId = $p['agent_id'] ?? null;
+    if (! is_string($nonce) || preg_match('/^[a-f0-9]{32}$/D', $nonce) !== 1 || ! is_int($agentId) || $agentId < 1) {
+        return $out(false, $v['url'], 'missing nonce or agent_id');
+    }
+    if (rtrim($old, '/') === $v['url']) {
+        return $out(true, $v['url'], 'already using this URL');
+    }
+
+    $send ??= 'nexovirt_probe_send';
+    $resp = $send($v['url'] . '/api/v1/agent/heartbeat', (string) ($config['token'] ?? ''),
+        nexovirt_json(['version' => AGENT_VERSION, 'probe' => $nonce]), $config['caBundle'] ?? null);
+    $status = is_int($resp['status'] ?? null) ? $resp['status'] : 0;
+    if ($status >= 300 && $status < 400) {
+        return $out(false, $v['url'], 'the new URL answered with a redirect (HTTP ' . $status . '), not followed');
+    }
+    if (! ($resp['ok'] ?? false) || $status !== 200) {
+        $why = $status > 0 ? 'HTTP ' . $status : substr((string) ($resp['body'] ?? 'no response'), 0, 160);
+        return $out(false, $v['url'], 'the panel did not answer at the new URL (' . $why . ')');
+    }
+    $body = json_decode((string) ($resp['body'] ?? ''), true);
+    $data = is_array($body) && is_array($body['data'] ?? null) ? $body['data'] : [];
+    if (! is_string($data['probe'] ?? null) || ! hash_equals($nonce, $data['probe']) || ($data['agent_id'] ?? null) !== $agentId) {
+        return $out(false, $v['url'], 'the new URL did not recognise this agent');
+    }
+
+    if (! nexovirt_conf_write_url($confPath ?? nexovirt_agent_conf_path(), $v['url'] . '/')) {
+        return $out(false, $v['url'], 'could not write the agent config');
+    }
+
+    return $out(true, $v['url'], 'test heartbeat ok, config updated');
 }
 
 /**
@@ -6643,7 +6889,7 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
         if (! $v['ok']) {
             return ['id' => $id, 'ok' => false, 'result' => 'invalid bridge_isolation_apply payload: ' . $v['error']];
         }
-        $r = nexovirt_isolation_apply($v['vmids'], $v['skip']);
+        $r = nexovirt_isolation_apply($v['vmids'], $v['skip'], $v['allow']);
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
@@ -6767,6 +7013,12 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
         // Every field is re-validated here (vmid, script checksum, env names/values, timeout).
         $r = nexovirt_lxc_app_install($p);
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['ok'] ? nexovirt_json($r['result']) : $r['error']];
+    }
+
+    if ($type === 'update_url') {
+        // Validated fail-closed and test-called before anything changes; the main loop switches its URL on ok.
+        $r = nexovirt_update_url($p, $config, $config['probeSend'] ?? null, $config['confPath'] ?? null);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result'], 'url' => $r['url']];
     }
 
     if ($type === 'lxc_app_status') {
@@ -6914,6 +7166,8 @@ function nexovirt_deliver(array $config, array $queue): array
  */
 function sendHeartbeat(array $config, array $stats, array $results = [], bool $busy = false): array
 {
+    // 0.29.0: the panel shows which address each agent reports to (Settings > Domain, Move agents).
+    $stats['panel_url'] = (string) ($config['url'] ?? '');
     $body = [
         'version' => AGENT_VERSION,
         'stats'   => $stats,
@@ -6948,6 +7202,7 @@ function sendWithCurl(string $url, string $token, string $payload, ?string $caBu
         CURLOPT_TIMEOUT        => REQUEST_TIMEOUT,
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_FOLLOWLOCATION => false, // never resend the bearer token to a redirect target
         CURLOPT_HTTPHEADER     => [
             'Content-Type: application/json',
             'Authorization: Bearer ' . $token,
@@ -6988,6 +7243,9 @@ function sendWithStream(string $url, string $token, string $payload, ?string $ca
             'content'       => $payload,
             'timeout'       => REQUEST_TIMEOUT,
             'ignore_errors' => true,
+            // Never resend the bearer token to a redirect target (PHP streams follow by default).
+            'follow_location' => 0,
+            'max_redirects'   => 0,
         ],
         'ssl' => [
             'verify_peer'      => true,
@@ -7047,13 +7305,14 @@ if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1') {
     // Keep-alive while a long job (e.g. a 30 min image download) blocks the loop, so the panel
     // doesn't mark the agent stale after 300s. Any jobs in its reply are ignored (the server hands
     // none out to a busy agent anyway).
-    $config['busyTick'] = static function () use ($config): void {
+    $makeTick = static fn (array $c): \Closure => static function () use ($c): void {
         nexovirt_isolation_tick_throttled();
-        $r = sendHeartbeat($config, collectStats(), [], true);
+        $r = sendHeartbeat($c, collectStats(), [], true);
         if (! $r['ok']) {
             fwrite(STDERR, '[' . date('Y-m-d H:i:s') . "] Busy heartbeat FAILED\n");
         }
     };
+    $config['busyTick'] = $makeTick($config);
 
     $queue = []; // undelivered job results (redelivered on the next heartbeat, bounded)
     $sweepLast  = 0; // last stale .part sweep of the image cache dir
@@ -7086,10 +7345,17 @@ if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1') {
                 $jobTs = date('Y-m-d H:i:s');
                 // Log only a prefix: results can be large JSON blobs.
                 fwrite(STDOUT, "[{$jobTs}] Job {$out['id']} " . ($out['ok'] ? 'OK' : 'ERROR') . ': ' . substr((string) $out['result'], 0, 200) . "\n");
-                $results[] = $out;
                 if (($job['type'] ?? '') === 'dyndns_configure') {
                     $dyndnsLast = 0; // publish right after the result is delivered
                 }
+                if (($job['type'] ?? '') === 'update_url' && $out['ok'] && ($out['url'] ?? '') !== '') {
+                    // The conf is already rewritten; switch in memory too (the result goes out on the new URL).
+                    fwrite(STDOUT, "[{$jobTs}] Panel URL changed: {$config['url']} -> {$out['url']}\n");
+                    $config['url']      = $out['url'];
+                    $config['busyTick'] = $makeTick($config);
+                }
+                unset($out['url']);
+                $results[] = $out;
             }
             $queue = nexovirt_queue_results($queue, $results, time());
             [$follow, $queue] = nexovirt_deliver($config, $queue);
