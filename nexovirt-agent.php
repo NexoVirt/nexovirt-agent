@@ -9,7 +9,7 @@
  *  lxc_root_ssh, lxc_set_password, scan_ips, dyndns_configure, apply_wireguard, read_wireguard,
  *  apt_refresh, apt_simulate, apt_upgrade_start, apt_upgrade_status, nat_inventory,
  *  nat_adopt_finalize, nat_adopt_restore, apply_dhcp, apply_fail2ban, read_fail2ban, fail2ban_unban,
- *  lxc_app_install, lxc_app_status)
+ *  lxc_app_install, lxc_app_status, ipv6_routes_apply, apply_web_proxy)
  *
  * A standalone PHP 8.0+ CLI script. No CodeIgniter dependency.
  * Install on a Proxmox VE host and point it at your NexoVirt panel.
@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.29.1';
+const AGENT_VERSION        = '0.32.0';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -169,6 +169,11 @@ function collectStats(): array
         }
     } catch (\Throwable $e) {
         fwrite(STDERR, '[nexovirt-agent] isolation report failed: ' . $e->getMessage() . PHP_EOL);
+    }
+
+    $r6 = nexovirt_routes6_report();
+    if ($r6 !== null) {
+        $stats['routes6'] = $r6;
     }
 
     return $stats;
@@ -5478,6 +5483,328 @@ function nexovirt_f2b_unban(string $ip, callable $run): array
 }
 
 // ---------------------------------------------------------------------------
+// Shared IPv4 web proxy (apply_web_proxy, agent 0.32.0). HAProxy in its OWN unit nexovirt-proxy.service with
+// /etc/nexovirt-proxy/haproxy.cfg: port 80 routed by Host header, port 443 by TLS SNI (pass-through, the guest keeps
+// its certificate), only on the chosen address of this node. Full desired set per job, validated fail-closed. Never
+// touches the distro haproxy.service or /etc/haproxy (only disables the distro unit when THIS agent installed the
+// package), refuses while any other process listens on 80/443 of that address, rolls back a config that fails
+// `haproxy -c` or a unit that is not active after the reload.
+// ---------------------------------------------------------------------------
+
+const WP_DIR         = '/etc/nexovirt-proxy';
+const WP_CFG         = WP_DIR . '/haproxy.cfg';
+const WP_STATE       = '/var/lib/nexovirt/web-proxy.json';
+const WP_MARK        = '/var/lib/nexovirt/web-proxy-installed-haproxy';
+const WP_UNIT        = 'nexovirt-proxy.service';
+const WP_UNIT_PATH   = '/etc/systemd/system/' . WP_UNIT;
+const WP_RUN         = '/run/nexovirt-proxy';
+const WP_MAX_DOMAINS = 2000;
+const WP_NAMES_LINE  = 30; // HAProxy allows 64 words per line
+
+/** RFC 1123 host name, lowercase ASCII, at least two labels, no wildcard, not all-numeric TLD. PURE. */
+function nexovirt_wp_valid_domain($d): bool
+{
+    return is_string($d) && strlen($d) <= 253
+        && preg_match('/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/D', $d) === 1
+        && preg_match('/\.[0-9]+$/D', $d) !== 1;
+}
+
+/** IPv4 inside 10/8, 172.16/12 or 192.168/16. PURE. */
+function nexovirt_wp_private4($ip): bool
+{
+    $l = is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false ? nexovirt_ip4_long($ip) : null;
+
+    return $l !== null && (($l >> 24) === 10 || ($l >> 20) === 0xAC1 || ($l >> 16) === 0xC0A8);
+}
+
+/** Validate an apply_web_proxy payload. PURE. @return array{ok:bool,error:string,cfg:array<string,mixed>} */
+function nexovirt_wp_validate(array $p): array
+{
+    $bad = static fn (string $e): array => ['ok' => false, 'error' => $e, 'cfg' => []];
+    $gen = $p['generation'] ?? null;
+    if (! is_int($gen) || $gen < 1) {
+        return $bad('generation must be a positive integer');
+    }
+    if (empty($p['enabled'])) {
+        return ['ok' => true, 'error' => '', 'cfg' => ['enabled' => false, 'pause' => ! empty($p['pause']), 'generation' => $gen]];
+    }
+    $bind = $p['bind_ip'] ?? '';
+    if (! is_string($bind) || filter_var($bind, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+        return $bad('bind_ip must be an IPv4 address');
+    }
+    $list = $p['domains'] ?? [];
+    if (! is_array($list) || count($list) > WP_MAX_DOMAINS) {
+        return $bad('domains must be a list of at most ' . WP_MAX_DOMAINS);
+    }
+    $seen = [];
+    $out  = [];
+    foreach ($list as $d) {
+        $name = is_array($d) ? ($d['domain'] ?? null) : null;
+        if (! nexovirt_wp_valid_domain($name)) {
+            return $bad('invalid domain');
+        }
+        if (isset($seen[$name])) {
+            return $bad('duplicate domain ' . $name);
+        }
+        if (! nexovirt_wp_private4($d['backend'] ?? null)) {
+            return $bad('backend of ' . $name . ' must be a private IPv4 address');
+        }
+        $seen[$name] = true;
+        $out[]       = ['domain' => $name, 'backend' => (string) $d['backend'], 'proxy_protocol' => ! empty($d['proxy_protocol'])];
+    }
+
+    return ['ok' => true, 'error' => '', 'cfg' => ['enabled' => true, 'generation' => $gen, 'bind_ip' => $bind, 'domains' => $out]];
+}
+
+/** The HAProxy configuration for a validated cfg. One backend pair per (address, PROXY protocol). PURE. */
+function nexovirt_wp_config(array $cfg): string
+{
+    $groups = [];
+    foreach ($cfg['domains'] as $d) {
+        $groups[$d['backend'] . ($d['proxy_protocol'] ? '|pp' : '')][] = $d;
+    }
+    $ip   = $cfg['bind_ip'];
+    $http = "frontend nx_http\n    bind {$ip}:80\n    mode http\n    http-request deny if { req.hdr_cnt(host) gt 1 }\n"
+        . "    http-request del-header X-Forwarded-For\n    option forwardfor\n";
+    $tls  = "frontend nx_https\n    bind {$ip}:443\n    mode tcp\n    tcp-request inspect-delay 5s\n"
+        . "    tcp-request content accept if { req_ssl_hello_type 1 }\n";
+    $back = '';
+    $i    = 0;
+    foreach ($groups as $g) {
+        $i++;
+        $pp = $g[0]['proxy_protocol'] ? ' send-proxy-v2' : '';
+        foreach (array_chunk(array_column($g, 'domain'), WP_NAMES_LINE) as $chunk) {
+            $names = implode(' ', $chunk);
+            $http .= "    use_backend nx_h{$i} if { hdr(host),field(1,:),lower,regsub(\\.$,) -m str {$names} }\n";
+            $tls  .= "    use_backend nx_t{$i} if { req_ssl_sni -i {$names} }\n";
+        }
+        $back .= "\nbackend nx_h{$i}\n    mode http\n    server s {$g[0]['backend']}:80 check{$pp}\n"
+            . "\nbackend nx_t{$i}\n    mode tcp\n    server s {$g[0]['backend']}:443 check{$pp}\n";
+    }
+    $http .= "    default_backend nx_none\n";
+
+    return "# Managed by nexovirt-agent (shared IPv4 web proxy). Rewritten on every apply: do not edit.\n"
+        . "global\n    log /dev/log local0 warning\n    maxconn 20000\n    hard-stop-after 30s\n\n"
+        . "defaults\n    log global\n    timeout connect 5s\n    timeout client 60s\n    timeout server 60s\n    timeout tunnel 1h\n\n"
+        . $http . "\n" . $tls . $back
+        . "\nbackend nx_none\n    mode http\n    http-request deny deny_status 404\n";
+}
+
+/**
+ * systemd unit of the proxy: unprivileged (the package's haproxy user, else a dynamic one), only CAP_NET_BIND_SERVICE,
+ * read-only system, writable only its runtime dir. PURE.
+ */
+function nexovirt_wp_unit(string $bin, bool $haproxyUser): string
+{
+    return "# Managed by nexovirt-agent.\n[Unit]\nDescription=NexoVirt shared IPv4 web proxy\nAfter=network-online.target\nWants=network-online.target\n\n"
+        . "[Service]\nType=notify\n" . ($haproxyUser ? "User=haproxy\nGroup=haproxy\n" : "DynamicUser=yes\n")
+        . "AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nNoNewPrivileges=yes\n"
+        . "ProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nProtectKernelTunables=yes\nProtectControlGroups=yes\n"
+        . "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\nRuntimeDirectory=nexovirt-proxy\nReadWritePaths=" . WP_RUN . "\n"
+        . "ExecStartPre={$bin} -c -q -f " . WP_CFG . "\nExecStart={$bin} -Ws -f " . WP_CFG . ' -p ' . WP_RUN . "/haproxy.pid\n"
+        . "ExecReload={$bin} -c -q -f " . WP_CFG . "\nExecReload=/bin/kill -USR2 \$MAINPID\nKillMode=mixed\nRestart=always\n\n"
+        . "[Install]\nWantedBy=multi-user.target\n";
+}
+
+/**
+ * TCP listeners on port 80/443 of $ip or a wildcard address, from `ss -ltnpH`. PURE.
+ *
+ * @return list<array{port:int,pid:int,proc:string}>
+ */
+function nexovirt_wp_port_users(string $ss, string $ip): array
+{
+    $out = [];
+    foreach (preg_split('/\r?\n/', $ss) ?: [] as $line) {
+        $col = preg_split('/\s+/', trim($line)) ?: [];
+        if (count($col) < 5 || preg_match('/^(.*):(\d+)$/', $col[3], $m) !== 1 || ! in_array((int) $m[2], [80, 443], true)) {
+            continue;
+        }
+        $host = trim((string) preg_replace('/%.*$/', '', $m[1]), '[]');
+        if (! in_array($host, ['*', '0.0.0.0', '::', $ip, '::ffff:' . $ip], true)) {
+            continue;
+        }
+        preg_match_all('/\("([^"]*)",pid=(\d+)/', $line, $u, PREG_SET_ORDER);
+        foreach ($u as $x) {
+            $out[] = ['port' => (int) $m[2], 'pid' => (int) $x[2], 'proc' => $x[1]];
+        }
+        if ($u === []) {
+            $out[] = ['port' => (int) $m[2], 'pid' => 0, 'proc' => 'an unknown process'];
+        }
+    }
+
+    return $out;
+}
+
+/** Ports of $ip that a process of nexovirt-proxy.service listens on now. @return array<int,true>|null null = ss failed */
+function nexovirt_wp_own_ports(string $ip, string $root, callable $run): ?array
+{
+    [$c, $ss] = $run('ss -ltnpH');
+    if ($c !== 0) {
+        return null;
+    }
+    $own = [];
+    foreach (nexovirt_wp_port_users((string) $ss, $ip) as $u) {
+        if ($u['pid'] > 0 && str_contains((string) @file_get_contents($root . '/proc/' . $u['pid'] . '/cgroup'), '/' . WP_UNIT)) {
+            $own[$u['port']] = true;
+        }
+    }
+
+    return $own;
+}
+
+/** Commands that stop and remove the proxy (disable + agent removal, mirrored by the panel). PURE. @return list<string> */
+function nexovirt_wp_clear_cmds(): array
+{
+    return [
+        'systemctl disable --now ' . WP_UNIT . ' 2>/dev/null || true',
+        'rm -rf ' . WP_DIR . ' ' . WP_UNIT_PATH . ' ' . WP_STATE . ' ' . WP_RUN,
+    ];
+}
+
+/** Newest generation this node applied (state file). */
+function nexovirt_wp_generation(string $root): int
+{
+    $s = json_decode((string) @file_get_contents($root . WP_STATE), true);
+
+    return is_array($s) ? (int) ($s['generation'] ?? 0) : 0;
+}
+
+function nexovirt_wp_set_generation(string $root, int $gen): void
+{
+    @mkdir(dirname($root . WP_STATE), 0755, true);
+    @file_put_contents($root . WP_STATE, nexovirt_json(['generation' => $gen]));
+}
+
+/** Write (enabled), pause (stop, keep files) or remove (disabled) the shared IPv4 web proxy. @return array{ok:bool,result:string} */
+function nexovirt_apply_web_proxy(array $p, string $root, callable $run): array
+{
+    $v = nexovirt_wp_validate($p);
+    if (! $v['ok']) {
+        return ['ok' => false, 'result' => 'invalid apply_web_proxy payload: ' . $v['error']];
+    }
+    $cfg = $v['cfg'];
+    if ($cfg['generation'] < nexovirt_wp_generation($root)) {
+        return ['ok' => false, 'result' => 'this job (generation ' . $cfg['generation'] . ') is older than the applied one; nothing changed'];
+    }
+    if (! $cfg['enabled']) {
+        $run('systemctl disable --now ' . WP_UNIT);
+        if (! $cfg['pause']) {
+            nexovirt_wp_rm($root . WP_DIR);
+            @unlink($root . WP_UNIT_PATH);
+            $run('systemctl daemon-reload');
+        }
+        nexovirt_wp_set_generation($root, $cfg['generation']);
+
+        return ['ok' => true, 'result' => nexovirt_json(['enabled' => false, 'paused' => $cfg['pause']])];
+    }
+    $ip  = $cfg['bind_ip'];
+    $own = (string) $run('ip -4 -o addr show')[1];
+    if (! preg_match('/\binet ' . preg_quote($ip, '/') . '\//', $own)) {
+        return ['ok' => false, 'result' => $ip . ' is not an address of this node; nothing changed'];
+    }
+    foreach ($cfg['domains'] as $d) {
+        if (preg_match('/\binet ' . preg_quote($d['backend'], '/') . '\//', $own)) {
+            return ['ok' => false, 'result' => $d['backend'] . ' is an address of this node, not a server; nothing changed'];
+        }
+    }
+    [$sc, $ss] = $run('ss -ltnpH');
+    if ($sc !== 0) {
+        return ['ok' => false, 'result' => 'could not list the listening ports of this node; nothing changed'];
+    }
+    foreach (nexovirt_wp_port_users((string) $ss, $ip) as $u) {
+        $cg = $u['pid'] > 0 ? (string) @file_get_contents($root . '/proc/' . $u['pid'] . '/cgroup') : '';
+        if (! str_contains($cg, '/' . WP_UNIT)) {
+            return ['ok' => false, 'result' => 'port ' . $u['port'] . ' is already used by ' . $u['proc'] . ' on this node. NexoVirt does not take over an existing web server; free the port or pick another address. Nothing changed'];
+        }
+    }
+    $installed = false;
+    [$c, $bin] = $run('command -v haproxy');
+    if ($c !== 0) {
+        $install = 'DEBIAN_FRONTEND=noninteractive timeout 120 apt-get install -y haproxy';
+        if ($run($install)[0] !== 0) {
+            $run('DEBIAN_FRONTEND=noninteractive timeout 60 apt-get update');
+            $run($install);
+        }
+        [$c, $bin] = $run('command -v haproxy');
+        if ($c !== 0) {
+            return ['ok' => false, 'result' => 'haproxy is not installed and could not be installed; nothing changed'];
+        }
+        $installed = true;
+        // The package starts its own haproxy.service; NexoVirt runs only its own unit.
+        $run('systemctl disable --now haproxy.service');
+        @mkdir(dirname($root . WP_MARK), 0755, true);
+        @file_put_contents($root . WP_MARK, "haproxy was installed by nexovirt-agent; its own haproxy.service was disabled.\n");
+    }
+    $bin = trim((string) $bin);
+    if (preg_match('#^/[A-Za-z0-9/._-]+$#', $bin) !== 1) {
+        return ['ok' => false, 'result' => 'unexpected haproxy path; nothing changed'];
+    }
+    @mkdir($root . WP_DIR, 0755, true);
+    $new = $root . WP_CFG . '.new';
+    if (@file_put_contents($new, nexovirt_wp_config($cfg)) === false) {
+        return ['ok' => false, 'result' => 'cannot write the proxy configuration'];
+    }
+    @chmod($new, 0644); // readable by the unprivileged proxy, writable only by root
+    [$tc, $to] = $run($bin . ' -c -q -f ' . escapeshellarg($new));
+    if ($tc !== 0) {
+        @unlink($new);
+
+        return ['ok' => false, 'result' => 'the proxy configuration check failed, the previous one stays: ' . nexovirt_cap_output(trim((string) $to), 2000)];
+    }
+    $old = is_file($root . WP_CFG) ? (string) file_get_contents($root . WP_CFG) : null;
+    if (! @rename($new, $root . WP_CFG)) {
+        @unlink($new);
+
+        return ['ok' => false, 'result' => 'cannot write the proxy configuration'];
+    }
+    $unit = nexovirt_wp_unit($bin, $run('id -u haproxy')[0] === 0);
+    if (! is_file($root . WP_UNIT_PATH) || file_get_contents($root . WP_UNIT_PATH) !== $unit) {
+        @file_put_contents($root . WP_UNIT_PATH, $unit);
+        $run('systemctl daemon-reload');
+    }
+    $run('systemctl enable ' . WP_UNIT);
+    [, $ro] = $run('systemctl reload-or-restart ' . WP_UNIT);
+    // A failed USR2 reload keeps the old workers and the unit "active": check that this unit holds both ports.
+    $listening = static function () use ($ip, $root, $run): bool {
+        $p = trim((string) $run('systemctl is-active ' . WP_UNIT)[1]) === 'active' ? nexovirt_wp_own_ports($ip, $root, $run) : null;
+
+        return $p !== null && isset($p[80], $p[443]);
+    };
+    if (! $listening()) {
+        $run('systemctl restart ' . WP_UNIT);
+    }
+    if ($listening()) {
+        nexovirt_wp_set_generation($root, $cfg['generation']);
+
+        return ['ok' => true, 'result' => nexovirt_json(['enabled' => true, 'domains' => count($cfg['domains']), 'installed_now' => $installed])];
+    }
+    if ($old !== null) {
+        @file_put_contents($root . WP_CFG, $old);
+        $run('systemctl restart ' . WP_UNIT);
+    } else {
+        $run('systemctl disable --now ' . WP_UNIT);
+    }
+
+    return ['ok' => false, 'result' => 'the proxy did not start on ' . $ip . ':80 and :443, the previous configuration was put back: ' . nexovirt_cap_output(trim((string) $ro), 2000)];
+}
+
+/** rm -rf of one of the agent's own directories (no shell). */
+function nexovirt_wp_rm(string $dir): void
+{
+    if (! is_dir($dir) || is_link($dir)) {
+        @unlink($dir);
+
+        return;
+    }
+    foreach (scandir($dir) ?: [] as $f) {
+        if ($f !== '.' && $f !== '..') {
+            is_dir($dir . '/' . $f) && ! is_link($dir . '/' . $f) ? nexovirt_wp_rm($dir . '/' . $f) : @unlink($dir . '/' . $f);
+        }
+    }
+    @rmdir($dir);
+}
+
+// ---------------------------------------------------------------------------
 // One-click apps: lxc_app_install, lxc_app_status (spec 2026-10-20-lxc-app-store-design)
 // ---------------------------------------------------------------------------
 
@@ -6532,11 +6859,368 @@ function nexovirt_isolation_tick_throttled(bool $force = false): void
         return;
     }
     $GLOBALS['nexovirt_isolation_last'] = $now;
+    nexovirt_routes6_tick_throttled();
     try {
         nexovirt_isolation_tick();
     } catch (\Throwable $e) {
         fwrite(STDERR, '[nexovirt-agent] isolation tick failed: ' . $e->getMessage() . PHP_EOL);
     }
+}
+
+// ---------------------------------------------------------------------------
+// ipv6_routes_apply (0.30.0): routed IPv6 prefixes. The panel sends the connection's full route list; this agent
+// installs the routes of guests whose config is on THIS node (a guest moved inside the cluster follows by itself).
+// Ownership: every route carries `proto 233` and only proto-233 routes are ever listed, added or deleted; a route of
+// another protocol for the same destination is reported as a conflict and never replaced. The state file lets the
+// loop restore routes every 30 s (after a reboot or an ifreload that recreated the bridge). IPv6 forwarding is only
+// switched on when the panel asks (forwarding=1); then accept_ra=2 keeps router-advertised default routes.
+// ---------------------------------------------------------------------------
+
+const ROUTES6_PROTO = 233;
+const ROUTES6_MAX   = 4096;
+
+function nexovirt_routes6_file(): string
+{
+    return nexovirt_isolation_dir() . '/routes6.json';
+}
+
+function nexovirt_routes6_sysctl_file(): string
+{
+    $d = getenv('NEXOVIRT_AGENT_SYSCTL_DIR');
+
+    return (is_string($d) && $d !== '' ? rtrim($d, '/') : '/etc/sysctl.d') . '/90-nexovirt-ipv6.conf';
+}
+
+/** Canonical global unicast IPv6 address (2000::/3) or null. PURE. */
+function nexovirt_routes6_addr(string $ip): ?string
+{
+    $b = @inet_pton($ip);
+    if (! is_string($b) || strlen($b) !== 16 || (ord($b[0]) & 0xE0) !== 0x20) {
+        return null;
+    }
+
+    return (string) inet_ntop($b);
+}
+
+/** Canonical `<net>/<len>` of a global unicast prefix /32../128 with zero host bits, or null. PURE. */
+function nexovirt_routes6_prefix(string $cidr): ?string
+{
+    if (preg_match('#^([0-9A-Fa-f:]+)/(\d{1,3})$#D', $cidr, $m) !== 1) {
+        return null;
+    }
+    $len = (int) $m[2];
+    $net = nexovirt_routes6_addr($m[1]);
+    if ($net === null || $len < 32 || $len > 128) {
+        return null;
+    }
+    $b = (string) inet_pton($net);
+    for ($i = 0; $i < 16; $i++) {
+        $bits = max(0, min(8, $len - $i * 8));
+        if ((ord($b[$i]) & ~(0xFF << (8 - $bits)) & 0xFF) !== 0) {
+            return null;
+        }
+    }
+
+    return $net . '/' . $len;
+}
+
+/** Fail-closed payload check: {routes:[{vmid,type,dst,via,dev}], forwarding?:0|1}. PURE. */
+function nexovirt_validate_routes6($p): array
+{
+    $bad = static fn (string $e): array => ['ok' => false, 'error' => $e];
+    if (! is_array($p) || ! isset($p['routes']) || ! is_array($p['routes']) || count($p['routes']) > ROUTES6_MAX) {
+        return $bad('routes must be a list');
+    }
+    $fwd = $p['forwarding'] ?? 0;
+    if (! in_array($fwd, [0, 1, true, false], true)) {
+        return $bad('forwarding must be 0 or 1');
+    }
+    $out = [];
+    foreach ($p['routes'] as $r) {
+        if (! is_array($r)) {
+            return $bad('route must be an object');
+        }
+        $vmid = $r['vmid'] ?? null;
+        $dst  = nexovirt_routes6_prefix((string) ($r['dst'] ?? ''));
+        $via  = (string) ($r['via'] ?? '');
+        $dev  = (string) ($r['dev'] ?? '');
+        if (! is_int($vmid) || $vmid < 100 || $vmid > 999999999) {
+            return $bad('invalid vmid');
+        }
+        if (! in_array($r['type'] ?? '', ['qemu', 'lxc'], true)) {
+            return $bad('invalid type');
+        }
+        if ($dst === null) {
+            return $bad('invalid dst');
+        }
+        if ($via !== '' && ($via = nexovirt_routes6_addr($via)) === null) {
+            return $bad('invalid via');
+        }
+        if (preg_match('/^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$/D', $dev) !== 1) {
+            return $bad('invalid dev');
+        }
+        $out[] = ['vmid' => $vmid, 'type' => (string) $r['type'], 'dst' => $dst, 'via' => (string) $via, 'dev' => $dev];
+    }
+
+    return ['ok' => true, 'routes' => $out, 'forwarding' => (bool) $fwd];
+}
+
+/** Our routes in the kernel: list of [dst, via, dev]. */
+function nexovirt_routes6_current(callable $run): array
+{
+    $cur = [];
+    foreach (explode("\n", (string) $run('ip -6 route show proto ' . ROUTES6_PROTO)[1]) as $line) {
+        $t = preg_split('/\s+/', trim($line));
+        if ($t === false || ($t[0] ?? '') === '') {
+            continue;
+        }
+        $dst = str_contains($t[0], '/') ? nexovirt_routes6_prefix($t[0]) : (($a = nexovirt_routes6_addr($t[0])) === null ? null : $a . '/128');
+        if ($dst === null) {
+            continue; // never a route we could have added
+        }
+        $via = '';
+        $dev = '';
+        foreach ($t as $i => $w) {
+            if ($w === 'via') {
+                $via = (string) nexovirt_routes6_addr((string) ($t[$i + 1] ?? ''));
+            } elseif ($w === 'dev') {
+                $dev = (string) ($t[$i + 1] ?? '');
+            }
+        }
+        $cur[] = ['dst' => $dst, 'via' => $via, 'dev' => $dev];
+    }
+
+    return $cur;
+}
+
+function nexovirt_routes6_cmd(string $op, array $r): string
+{
+    return 'ip -6 route ' . $op . ' ' . escapeshellarg($r['dst']) . ($r['via'] !== '' ? ' via ' . escapeshellarg($r['via']) : '')
+        . ' dev ' . escapeshellarg($r['dev']) . ' proto ' . ROUTES6_PROTO;
+}
+
+/** Make the kernel hold exactly the desired local routes (ours only). */
+/**
+ * Guest config files on THIS node: ['qemu' => [vmid => true], 'lxc' => [...]], or null when /etc/pve cannot be read
+ * (pve-cluster down or not mounted yet): then nothing may change, a missing list must never look like missing guests.
+ */
+function nexovirt_routes6_local_guests(): ?array
+{
+    $root = getenv('NEXOVIRT_AGENT_PVE_ETC');
+    $root = is_string($root) && $root !== '' ? rtrim($root, '/') : '/etc/pve';
+    $out  = [];
+    foreach (['qemu' => 'qemu-server', 'lxc' => 'lxc'] as $type => $dir) {
+        $list = is_dir($root . '/' . $dir) ? @scandir($root . '/' . $dir) : false;
+        if ($list === false) {
+            return null;
+        }
+        $out[$type] = [];
+        foreach ($list as $f) {
+            if (preg_match('/^(\d+)\.conf$/D', $f, $m) === 1) {
+                $out[$type][(int) $m[1]] = true;
+            }
+        }
+    }
+
+    return $out;
+}
+
+/** Make the kernel hold exactly the desired local routes (ours only). */
+function nexovirt_routes6_reconcile(array $routes, callable $run): array
+{
+    $res   = ['active' => 0, 'conflicts' => [], 'missing_dev' => [], 'failed' => []];
+    $local = nexovirt_routes6_local_guests();
+    if ($local === null) {
+        // Fail safe: without a full read of the guest configs nothing is added or deleted.
+        return $res + ['skipped' => 'pve_unreadable', 'forwarding' => trim((string) $run('sysctl -n net.ipv6.conf.all.forwarding')[1]) === '1' ? 1 : 0];
+    }
+    $key  = static fn (array $r): string => $r['dst'] . '|' . $r['via'] . '|' . $r['dev'];
+    $want = [];
+    foreach ($routes as $r) {
+        if (isset($local[$r['type']][$r['vmid']])) {
+            $want[$key($r)] = $r;
+        }
+    }
+    // On-link host routes first: a next hop must be reachable before the prefix route that uses it.
+    uasort($want, static fn ($a, $b) => [$a['via'] !== '', $a['dst']] <=> [$b['via'] !== '', $b['dst']]);
+    $have = [];
+    foreach (nexovirt_routes6_current($run) as $r) {
+        $have[$key($r)] = $r;
+    }
+    foreach (array_diff_key($have, $want) as $r) {
+        $run(nexovirt_routes6_cmd('del', $r));
+    }
+    foreach ($want as $k => $r) {
+        if (isset($have[$k])) {
+            $res['active']++;
+            continue;
+        }
+        if (! is_dir(nexovirt_isolation_net_dir() . '/' . $r['dev'])) {
+            $res['missing_dev'][$r['dev']] = $r['dev'];
+            continue;
+        }
+        if (trim((string) $run('ip -6 route show exact ' . escapeshellarg($r['dst']))[1]) !== '') {
+            $res['conflicts'][] = $r['dst']; // a route someone else made: left alone
+            continue;
+        }
+        if ($run(nexovirt_routes6_cmd('add', $r))[0] === 0) {
+            $res['active']++;
+        } else {
+            $res['failed'][] = $r['dst'];
+        }
+    }
+    $res['missing_dev'] = array_values($res['missing_dev']);
+    $res['forwarding']  = trim((string) $run('sysctl -n net.ipv6.conf.all.forwarding')[1]) === '1' ? 1 : 0;
+
+    return $res;
+}
+
+function nexovirt_routes6_prev_file(): string
+{
+    return nexovirt_isolation_dir() . '/routes6-prev.conf';
+}
+
+/** Put sysctl values back (slash-form keys, so VLAN interfaces like vmbr0.100 work). */
+function nexovirt_routes6_sysctl_restore(array $prev, callable $run): void
+{
+    foreach ($prev as $k => $v) {
+        if ($v !== '' && preg_match('#^net/ipv6/conf/[A-Za-z0-9][A-Za-z0-9_.-]{0,14}/(accept_ra|forwarding)$#D', $k) === 1 && ctype_digit($v)) {
+            $run('sysctl -w ' . escapeshellarg($k . '=' . $v));
+        }
+    }
+}
+
+/**
+ * Turn IPv6 forwarding on without cutting the node's own IPv6: accept_ra=2 first on every interface with a
+ * router-advertised default route or a SLAAC (dynamic) address, and on all/default (new interfaces after a reboot),
+ * then forwarding; a default route the node had before must still be there afterwards, else everything goes back. Only then the
+ * sysctl.d file is written. The values before are kept (routes6-prev.conf) for the agent removal. Returns an error or null.
+ */
+function nexovirt_routes6_forwarding_on(callable $run): ?string
+{
+    $devs = [];
+    foreach (explode("\n", (string) $run('ip -6 route show default proto ra')[1]) as $line) {
+        if (preg_match('/\bdev\s+([A-Za-z0-9][A-Za-z0-9_.-]{0,14})(?:\s|$)/', $line, $m) === 1) {
+            $devs[$m[1]] = true;
+        }
+    }
+    foreach (explode("\n", (string) $run('ip -6 -o addr show dynamic')[1]) as $line) {
+        if (preg_match('/^\d+:\s+([A-Za-z0-9][A-Za-z0-9_.-]{0,14})(?:@\S+)?\s+inet6\s/', $line, $m) === 1) {
+            $devs[$m[1]] = true;
+        }
+    }
+    $keys = [];
+    foreach (array_merge(array_keys($devs), ['all', 'default']) as $d) {
+        $keys[] = 'net/ipv6/conf/' . $d . '/accept_ra';
+    }
+    // A node with no IPv6 default route before (static IPv6 without one, an internal router) has none to lose.
+    $hadDefault = trim((string) $run('ip -6 route show default')[1]) !== '';
+    $prev = ['net/ipv6/conf/all/forwarding' => trim((string) $run('sysctl -n net.ipv6.conf.all.forwarding')[1])];
+    foreach ($keys as $k) {
+        $prev[$k] = trim((string) $run('sysctl -n ' . escapeshellarg($k))[1]);
+    }
+    $back = static function () use ($prev, $run): void {
+        nexovirt_routes6_sysctl_restore($prev, $run);
+        @unlink(nexovirt_routes6_sysctl_file());
+    };
+    foreach ($keys as $k) {
+        if ($run('sysctl -w ' . escapeshellarg($k . '=2'))[0] !== 0) {
+            $back();
+
+            return 'IPv6 forwarding was not turned on: ' . $k . ' could not be set. Nothing was changed.';
+        }
+    }
+    if ($run("sysctl -w 'net.ipv6.conf.all.forwarding=1'")[0] !== 0) {
+        $back();
+
+        return 'IPv6 forwarding could not be turned on. Nothing was changed.';
+    }
+    if ($hadDefault && trim((string) $run('ip -6 route show default')[1]) === '') {
+        $back();
+
+        return 'IPv6 forwarding was not turned on: the node had no IPv6 default route afterwards, so everything was put back. Check the uplink IPv6 setup (a static default route, or accept_ra=2 on the interface that gets router advertisements).';
+    }
+    $lines = ['# Managed by nexovirt-agent - IPv6 forwarding for routed prefixes (removed with the agent).'];
+    foreach ($keys as $k) {
+        $lines[] = $k . ' = 2';
+    }
+    $lines[] = 'net/ipv6/conf/all/forwarding = 1';
+    @file_put_contents(nexovirt_routes6_sysctl_file(), implode("\n", $lines) . "\n");
+    if (! is_file(nexovirt_routes6_prev_file())) {
+        // sysctl.conf format, so the agent removal can put it back with `sysctl -p` (AgentLifecycle teardown-network).
+        $keep = '';
+        foreach ($prev as $k => $val) {
+            $keep .= ctype_digit($val) ? $k . ' = ' . $val . "\n" : '';
+        }
+        nexovirt_write_private(nexovirt_routes6_prev_file(), $keep);
+    }
+
+    return null;
+}
+
+function nexovirt_routes6_exec(string $cmd): array
+{
+    $out = [];
+    exec($cmd . ' 2>&1', $out, $code);
+
+    return [$code, implode("\n", $out)];
+}
+
+/** ipv6_routes_apply: store the list, reconcile at once. $run is a test seam. */
+function nexovirt_routes6_apply(array $v, ?callable $run = null): array
+{
+    if ($run === null) {
+        if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1') {
+            return ['ok' => true, 'result' => json_encode(['active' => 0, 'conflicts' => [], 'missing_dev' => [], 'forwarding' => 0, 'dryrun' => true])];
+        }
+        $run = 'nexovirt_routes6_exec';
+    }
+    @mkdir(nexovirt_isolation_dir(), 0755, true);
+    if (! nexovirt_write_private(nexovirt_routes6_file(), (string) json_encode(['routes' => $v['routes']]))) {
+        return ['ok' => false, 'result' => 'could not store the route list'];
+    }
+    if ($v['forwarding'] && ($why = nexovirt_routes6_forwarding_on($run)) !== null) {
+        return ['ok' => false, 'result' => $why];
+    }
+    $res = nexovirt_routes6_reconcile($v['routes'], $run);
+    $GLOBALS['nexovirt_routes6_report'] = $res;
+
+    return ['ok' => true, 'result' => (string) json_encode($res)];
+}
+
+/** Loop pass: restore the stored routes. Cheap no-op without a state file. Never throws. */
+function nexovirt_routes6_tick(?callable $run = null): void
+{
+    try {
+        $raw = @file_get_contents(nexovirt_routes6_file());
+        if (! is_string($raw)) {
+            return;
+        }
+        $v = nexovirt_validate_routes6(json_decode($raw, true) + ['forwarding' => 0]);
+        if (! $v['ok'] || ($run === null && getenv('NEXOVIRT_AGENT_DRYRUN') === '1')) {
+            return;
+        }
+        $GLOBALS['nexovirt_routes6_report'] = nexovirt_routes6_reconcile($v['routes'], $run ?? 'nexovirt_routes6_exec');
+    } catch (\Throwable $e) {
+        fwrite(STDERR, '[nexovirt-agent] IPv6 route restore failed: ' . $e->getMessage() . PHP_EOL);
+    }
+}
+
+function nexovirt_routes6_tick_throttled(): void
+{
+    if (time() - (int) ($GLOBALS['nexovirt_routes6_last'] ?? 0) < 30) {
+        return;
+    }
+    $GLOBALS['nexovirt_routes6_last'] = time();
+    nexovirt_routes6_tick();
+}
+
+/** Heartbeat stats.routes6 (null when this node has no route list). */
+function nexovirt_routes6_report(): ?array
+{
+    $r = $GLOBALS['nexovirt_routes6_report'] ?? null;
+
+    return is_array($r) ? $r : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -6893,6 +7577,15 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
+    if ($type === 'ipv6_routes_apply') {
+        $v = nexovirt_validate_routes6($p);
+        if (! $v['ok']) {
+            return ['id' => $id, 'ok' => false, 'result' => 'invalid ipv6_routes_apply payload: ' . $v['error']];
+        }
+        $r = nexovirt_routes6_apply($v);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
     if ($type === 'set_ip_forward') {
         // payload {enabled: 0|1}: the only accepted field; anything else is ignored.
         $r = nexovirt_set_ip_forward(! empty($p['enabled']));
@@ -6967,6 +7660,13 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
     if ($type === 'apply_fail2ban') {
         [$root, $run] = nexovirt_node_ctx($config);
         $r = nexovirt_apply_fail2ban($p, $root, $run);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
+    if ($type === 'apply_web_proxy') {
+        // Full desired set of the shared IPv4 web proxy; re-validated fail-closed, refuses next to another web server.
+        [$root, $run] = nexovirt_node_ctx($config);
+        $r = nexovirt_apply_web_proxy($p, $root, $run);
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
