@@ -6,7 +6,7 @@
  * (write_snippet, ensure_storage, download_image, delete_image, apply_nat,
  *  clear_nat, read_firewall, read_system, read_pve, read_logs, read_pve_logs,
  *  probe_sdn_dhcp, ensure_sdn_dhcp, ensure_sdn_egress, set_ip_forward,
- *  lxc_root_ssh, lxc_set_password, scan_ips, dyndns_configure, apply_wireguard, read_wireguard,
+ *  lxc_root_ssh, lxc_set_password, lxc_ssh_keys, scan_ips, dyndns_configure, apply_wireguard, read_wireguard,
  *  apt_refresh, apt_simulate, apt_upgrade_start, apt_upgrade_status, nat_inventory,
  *  nat_adopt_finalize, nat_adopt_restore, apply_dhcp, apply_fail2ban, read_fail2ban, fail2ban_unban,
  *  lxc_app_install, lxc_app_status, ipv6_routes_apply, apply_web_proxy)
@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.32.0';
+const AGENT_VERSION        = '0.33.0';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -1379,6 +1379,83 @@ function nexovirt_lxc_set_password(int $vmid, string $password): array
     return $code === 0
         ? ['ok' => true, 'result' => 'password set']
         : ['ok' => false, 'result' => 'chpasswd failed: ' . (trim($out) !== '' ? trim($out) : ('exit ' . $code))];
+}
+
+/**
+ * root's SSH keys in a RUNNING container (/root/.ssh/authorized_keys): op list | add | remove, run through
+ * `pct exec` with a FIXED script (the panel's GuestSshKeys::SCRIPT, same text: AgentSshKeysScriptTest). The key
+ * line is the script's argument, never part of the script; every value is validated and escapeshellarg'd.
+ * Never starts a stopped container. Returns ['ok'=>bool,'result'=>JSON {exit,out,err} | error text].
+ */
+const LXC_SSH_KEYS_SCRIPT = <<<'SH'
+set -u
+F=/root/.ssh/authorized_keys
+case "$1" in
+list)
+  [ -f "$F" ] && cat "$F"
+  exit 0 ;;
+add)
+  umask 077
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh || exit 3
+  touch "$F" && chmod 600 "$F" || exit 3
+  cp -p "$F" "$F.nexovirt-bak" || exit 3
+  grep -qxF -- "$2" "$F" && exit 0
+  if [ -s "$F" ] && [ "$(tail -c 1 "$F" | od -An -c | tr -d ' ')" != '\n' ]; then printf '\n' >> "$F"; fi
+  printf '%s\n' "$2" >> "$F" || exit 3
+  exit 0 ;;
+remove)
+  [ -f "$F" ] || exit 0
+  cp -p "$F" "$F.nexovirt-bak" || exit 3
+  grep -vxF -- "$2" "$F" > "$F.nexovirt-tmp"
+  [ $? -le 1 ] || { rm -f "$F.nexovirt-tmp"; exit 3; }
+  chmod 600 "$F.nexovirt-tmp" && mv "$F.nexovirt-tmp" "$F" || exit 3
+  exit 0 ;;
+esac
+exit 2
+SH;
+
+/** Validate an lxc_ssh_keys payload (fail-closed). PURE. @return array{ok:bool,error?:string} */
+function nexovirt_lxc_ssh_keys_validate(int $vmid, string $op, string $arg): array
+{
+    if ($vmid < 1) {
+        return ['ok' => false, 'error' => 'invalid vmid'];
+    }
+    if (! in_array($op, ['list', 'add', 'remove'], true)) {
+        return ['ok' => false, 'error' => 'invalid op'];
+    }
+    if (strpbrk($arg, "\r\n\0") !== false || strlen($arg) > 8192 || ($op !== 'list' && trim($arg) === '')) {
+        return ['ok' => false, 'error' => 'invalid key line'];
+    }
+
+    return ['ok' => true];
+}
+
+function nexovirt_lxc_ssh_keys(int $vmid, string $op, string $arg): array
+{
+    $v = nexovirt_lxc_ssh_keys_validate($vmid, $op, $arg);
+    if (! $v['ok']) {
+        return ['ok' => false, 'result' => $v['error']];
+    }
+    $id = escapeshellarg((string) $vmid);
+    $st = [];
+    exec("pct status {$id} 2>&1", $st);
+    if (strpos(strtolower(implode("\n", $st)), 'running') === false) {
+        return ['ok' => false, 'result' => 'The container is not running. Start it to manage its SSH keys.'];
+    }
+    $cmd  = "pct exec {$id} -- sh -c " . escapeshellarg(LXC_SSH_KEYS_SCRIPT) . ' nexovirt ' . escapeshellarg($op) . ' ' . escapeshellarg($arg);
+    $desc = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open($cmd, $desc, $pipes);
+    if (! is_resource($proc)) {
+        return ['ok' => false, 'result' => 'proc_open failed'];
+    }
+    fclose($pipes[0]);
+    $out  = (string) stream_get_contents($pipes[1]);
+    $err  = (string) stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $code = proc_close($proc);
+
+    return ['ok' => true, 'result' => nexovirt_json(['exit' => $code, 'out' => substr($out, 0, 262144), 'err' => substr($err, 0, 2000)])];
 }
 
 // ---------------------------------------------------------------------------
@@ -7598,6 +7675,11 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
             return ['id' => $id, 'ok' => false, 'result' => 'invalid lxc_root_ssh payload'];
         }
         $r = nexovirt_lxc_root_ssh($vmid);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
+    if ($type === 'lxc_ssh_keys') {
+        $r = nexovirt_lxc_ssh_keys((int) ($p['vmid'] ?? 0), (string) ($p['op'] ?? ''), (string) ($p['key'] ?? ''));
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
