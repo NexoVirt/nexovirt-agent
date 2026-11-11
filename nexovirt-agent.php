@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.33.0';
+const AGENT_VERSION        = '0.34.1';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -4041,6 +4041,1012 @@ function nexovirt_read_pve(): array
     ];
 }
 
+/** Maximum bytes captured from each read_disks sub-command (lsblk trees grow with thin LVs). */
+const DISK_OUTPUT_CAP = 524288;
+
+/** Local file systems whose mounts the disk scan checks for open files. */
+const DISK_LOCAL_FS = ['ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'zfs', 'f2fs', 'jfs', 'vfat', 'ntfs', 'ntfs3', 'exfat'];
+
+/** A mount target the agent may pass to fuser / umount: absolute, plain characters, no "..". */
+function nexovirt_mount_target_ok(string $t): bool
+{
+    return $t !== '' && $t[0] === '/' && strlen($t) <= 255 && ! str_contains($t, '..') && preg_match('#^/[A-Za-z0-9._/@+:-]*$#', $t) === 1;
+}
+
+/** Whole physical disks the disk scan inspects with wipefs (never zvols, device mapper, loop or rbd). */
+const DISK_PATH_RE = '#^/dev/(sd[a-z]{1,3}|nvme[0-9]{1,3}n[0-9]{1,3}|vd[a-z]{1,3}|xvd[a-z]{1,3}|hd[a-z]{1,3})$#';
+
+/**
+ * The /dev paths a guest config refers to (disk passthrough: scsi0: /dev/disk/by-id/..., mp0: /dev/sdb1, ...).
+ * Pure: config text in, raw /dev paths out (the caller resolves symlinks).
+ *
+ * @return list<string>
+ */
+function nexovirt_disk_refs_from_conf(string $conf): array
+{
+    preg_match_all('#(?<![A-Za-z0-9_./-])/dev/[A-Za-z0-9._:+/-]+#', $conf, $m);
+    $out = [];
+    foreach ($m[0] as $path) {
+        $path = rtrim($path, ',');
+        if (! str_contains($path, '..')) {
+            $out[$path] = true;
+        }
+    }
+
+    return array_keys($out);
+}
+
+/**
+ * PCI and USB passthrough in a guest config: hostpciN ids (0000:01:00.0, 01:00, a;b) and usbN host ids
+ * (vendor:product or bus-port), plus resource mapping names. Pure.
+ *
+ * @return array{pci: list<string>, usb: list<string>, pci_map: list<string>, usb_map: list<string>}
+ */
+function nexovirt_passthrough_from_conf(string $conf): array
+{
+    $out = ['pci' => [], 'usb' => [], 'pci_map' => [], 'usb_map' => []];
+    foreach (preg_split('/\R/', $conf) ?: [] as $line) {
+        if (preg_match('/^\s*\[/', $line)) {
+            break; // snapshot sections repeat the current devices
+        }
+        if (preg_match('/^\s*hostpci[0-9]+\s*:\s*(\S+)/', $line, $m)) {
+            foreach (explode(',', $m[1]) as $i => $part) {
+                if (str_starts_with($part, 'mapping=')) {
+                    $out['pci_map'][] = substr($part, 8);
+                } elseif ($i === 0 || str_starts_with($part, 'host=')) {
+                    foreach (explode(';', (string) preg_replace('/^host=/', '', $part)) as $id) {
+                        if (preg_match('/^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}(\.[0-7])?$/', $id)) {
+                            $out['pci'][] = strtolower($id);
+                        }
+                    }
+                }
+            }
+        }
+        if (preg_match('/^\s*usb[0-9]+\s*:\s*(\S+)/', $line, $m)) {
+            foreach (explode(',', $m[1]) as $part) {
+                if (str_starts_with($part, 'mapping=')) {
+                    $out['usb_map'][] = substr($part, 8);
+                } elseif (str_starts_with($part, 'host=')) {
+                    $out['usb'][] = strtolower(substr($part, 5));
+                }
+            }
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * Ids a PVE resource mapping file (/etc/pve/mapping/pci.cfg or usb.cfg) gives $names on $node:
+ * `map node=<n>,path=<pci>` / `map id=<vid:pid>,node=<n>[,path=<bus-port>]`. Pure.
+ *
+ * @param list<string> $names
+ * @return list<string>
+ */
+function nexovirt_mapping_ids(string $cfg, string $node, array $names): array
+{
+    $out     = [];
+    $current = null;
+    foreach (preg_split('/\R/', $cfg) ?: [] as $line) {
+        if (preg_match('/^(pci|usb|dir):\s*(\S+)/', $line, $m)) {
+            $current = $m[2];
+            continue;
+        }
+        if ($current === null || ! in_array($current, $names, true) || ! preg_match('/^\s+map\s+(\S+)/', $line, $m)) {
+            continue;
+        }
+        $kv = [];
+        foreach (explode(',', $m[1]) as $pair) {
+            [$k, $v] = array_pad(explode('=', $pair, 2), 2, '');
+            $kv[$k] = $v;
+        }
+        if (($kv['node'] ?? '') !== $node) {
+            continue;
+        }
+        foreach (['path', 'id'] as $k) {
+            $raw = (string) ($kv[$k] ?? '');
+            foreach (explode(';', str_starts_with($raw, '/') ? $raw : strtolower($raw)) as $id) {
+                if ($id !== '') {
+                    $out[] = $id;
+                }
+            }
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * Where a block device hangs in sysfs: the realpath of /sys/block/<name> (holds the PCI addresses of the
+ * controller chain) and its USB devices (bus-port + vendor:product). Read-only.
+ *
+ * @return array{sys: string, usb: list<array{port: string, id: string}>}|null
+ */
+function nexovirt_disk_sysfs(string $path): ?array
+{
+    $real = @realpath('/sys/block/' . basename($path));
+    if (! is_string($real) || ! str_starts_with($real, '/sys/devices/')) {
+        return null;
+    }
+    $usb    = [];
+    $prefix = '';
+    foreach (explode('/', trim($real, '/')) as $seg) {
+        $prefix .= '/' . $seg;
+        if (preg_match('/^[0-9]+-[0-9]+(\.[0-9]+)*$/', $seg)) {
+            $vid   = trim(nexovirt_read_file_capped($prefix . '/idVendor'));
+            $pid   = trim(nexovirt_read_file_capped($prefix . '/idProduct'));
+            $usb[] = ['port' => $seg, 'id' => strtolower($vid . ':' . $pid)];
+        }
+    }
+
+    return ['sys' => $real, 'usb' => $usb];
+}
+
+/**
+ * Absolute host paths a guest config uses outside /dev (pure): LXC `mpN: /mnt/x/data,mp=/data`,
+ * `lxc.mount.entry: /mnt/x/y mnt/y none bind`, and QEMU disks on a file path (`scsi1: /mnt/x/vm.qcow2`).
+ *
+ * @return list<string>
+ */
+function nexovirt_host_paths_from_conf(string $conf): array
+{
+    $out = [];
+    foreach (preg_split('/\R/', $conf) ?: [] as $line) {
+        if (preg_match('/^\s*\[/', $line)) {
+            break;
+        }
+        $path = null;
+        if (preg_match('/^\s*(?:mp[0-9]+|rootfs|(?:scsi|virtio|sata|ide|efidisk|tpmstate)[0-9]+)\s*:\s*(\S+)/', $line, $m)) {
+            // First field, or the file=/volume= option (scsi1: file=/mnt/x/a.qcow2,size=8G).
+            $path = explode(',', $m[1])[0];
+            foreach (explode(',', $m[1]) as $opt) {
+                if (preg_match('/^(?:file|volume)=(.+)$/', $opt, $fm)) {
+                    $path = $fm[1];
+                }
+            }
+            $path = (string) preg_replace('/^(?:file|volume)=/', '', $path);
+        } elseif (preg_match('/^\s*lxc\.mount\.entry\s*[:=]\s*(\S+)/', $line, $m)) {
+            $path = $m[1];
+        }
+        if ($path !== null && str_starts_with($path, '/') && ! str_starts_with($path, '/dev/') && ! str_contains($path, '..')) {
+            $out[rtrim($path, '/') ?: '/'] = true;
+        }
+    }
+
+    return array_keys($out);
+}
+
+/** virtiofsN directory mapping names in a guest config (pure). @return list<string> */
+function nexovirt_virtiofs_maps_from_conf(string $conf): array
+{
+    $out = [];
+    foreach (preg_split('/\R/', $conf) ?: [] as $line) {
+        if (preg_match('/^\s*\[/', $line)) {
+            break;
+        }
+        if (preg_match('/^\s*virtiofs[0-9]+\s*:\s*(\S+)/', $line, $m)) {
+            foreach (explode(',', $m[1]) as $i => $part) {
+                if (str_starts_with($part, 'dirid=') || ($i === 0 && ! str_contains($part, '='))) {
+                    $out[] = preg_replace('/^dirid=/', '', $part);
+                }
+            }
+        }
+    }
+
+    return array_values(array_unique($out));
+}
+
+/**
+ * Everything this node's guest configs pass to guests: /dev paths (realpath resolved, original kept),
+ * host paths, hostpciN and usbN ids (resource mappings of this node resolved). Read-only.
+ *
+ * @return array{devs: list<array>, paths: list<array>, pci: list<array>, usb: list<array>}
+ */
+function nexovirt_guest_refs(): array
+{
+    $out  = ['devs' => [], 'paths' => [], 'pci' => [], 'usb' => []];
+    $maps = ['pci' => [], 'usb' => [], 'dir' => []];
+    foreach (array_merge(glob('/etc/pve/qemu-server/*.conf') ?: [], glob('/etc/pve/lxc/*.conf') ?: []) as $file) {
+        if (! preg_match('#/([0-9]{1,9})\.conf$#', $file, $mm)) {
+            continue;
+        }
+        $vmid = (int) $mm[1];
+        $conf = nexovirt_read_file_capped($file);
+        foreach (nexovirt_disk_refs_from_conf($conf) as $ref) {
+            $real          = @realpath($ref);
+            $out['devs'][] = ['vmid' => $vmid, 'dev' => is_string($real) && str_starts_with($real, '/dev/') ? $real : $ref, 'ref' => $ref];
+        }
+        foreach (nexovirt_host_paths_from_conf($conf) as $path) {
+            $real           = @realpath($path);
+            $out['paths'][] = ['vmid' => $vmid, 'path' => is_string($real) ? $real : $path];
+        }
+        foreach (nexovirt_virtiofs_maps_from_conf($conf) as $name) {
+            $maps['dir'][$name] = $vmid;
+        }
+        $pt = nexovirt_passthrough_from_conf($conf);
+        foreach (['pci', 'usb'] as $k) {
+            foreach ($pt[$k] as $id) {
+                $out[$k][] = ['vmid' => $vmid, 'id' => $id];
+            }
+            foreach ($pt[$k . '_map'] as $name) {
+                $maps[$k][$name] = $vmid;
+            }
+        }
+    }
+    $node = trim((string) @gethostname());
+    foreach (['pci', 'usb', 'dir'] as $k) {
+        if ($maps[$k] === []) {
+            continue;
+        }
+        $cfg = nexovirt_read_file_capped('/etc/pve/mapping/' . $k . '.cfg');
+        foreach ($maps[$k] as $name => $vmid) {
+            foreach (nexovirt_mapping_ids($cfg, $node, [(string) $name]) as $id) {
+                if ($k === 'dir') {
+                    // virtiofs: a host directory shared with the guest.
+                    $real           = @realpath($id);
+                    $out['paths'][] = ['vmid' => $vmid, 'path' => is_string($real) ? $real : $id];
+                } else {
+                    $out[$k][] = ['vmid' => $vmid, 'id' => $id];
+                }
+            }
+        }
+    }
+    foreach ($out as $k => $v) {
+        $out[$k] = array_slice($v, 0, 500);
+    }
+
+    return $out;
+}
+
+/** `zpool list -v -H -P -o name` -> pool => vdev paths (pure). @return array<string,list<string>> */
+function nexovirt_zpool_vdevs(string $out): array
+{
+    $pools = [];
+    $cur   = null;
+    foreach (preg_split('/\R/', $out) ?: [] as $line) {
+        if ($line === '') {
+            continue;
+        }
+        if ($line[0] !== "\t" && $line[0] !== ' ') {
+            $cur         = trim($line);
+            $pools[$cur] = [];
+        } elseif ($cur !== null && str_starts_with(trim($line), '/')) {
+            $pools[$cur][] = trim($line);
+        }
+    }
+
+    return $pools;
+}
+
+/**
+ * Imported ZFS pools and their vdevs (realpath resolved). zpool not installed = nothing imported;
+ * a failing zpool command = null (unknown).
+ *
+ * @return array{pools: array<string,list<string>>}|null
+ */
+function nexovirt_zpool_read(): ?array
+{
+    if (! nexovirt_bin_installed('zpool')) {
+        return ['pools' => []];
+    }
+    [$rc, $out] = nexovirt_run_rc('zpool list -v -H -P -o name 2>/dev/null');
+    if ($rc !== 0) {
+        return null;
+    }
+    $pools = [];
+    foreach (nexovirt_zpool_vdevs($out) as $name => $vdevs) {
+        $pools[$name] = array_map(static function (string $v): string {
+            $r = @realpath($v);
+            return is_string($r) ? $r : $v;
+        }, $vdevs);
+    }
+
+    return ['pools' => $pools];
+}
+
+/** Holders of a block device (/sys/class/block/<kname>/holders): device-mapper / md users. @return list<string> */
+function nexovirt_block_holders(string $kname): array
+{
+    if (! preg_match('/^[A-Za-z0-9._-]{1,64}$/', $kname)) {
+        return ['?'];
+    }
+    $dir = '/sys/class/block/' . $kname . '/holders';
+    if (! is_dir($dir)) {
+        return [];
+    }
+
+    return array_values(array_diff(scandir($dir) ?: [], ['.', '..']));
+}
+
+/**
+ * LVM tools print notices such as "File descriptor 3 (...) leaked on pvs invocation" before their JSON report:
+ * keep only the JSON object.
+ */
+function nexovirt_lvm_json(string $out): string
+{
+    $at = strpos($out, '{');
+
+    return $at === false ? '' : substr($out, $at);
+}
+
+/**
+ * Read the node's disk facts for the panel's disk list and "unused disk" check. READ-ONLY, no parameters:
+ * lsblk (tree, bytes), findmnt (mount table, no statfs so a dead network mount cannot hang it), pvs
+ * (LVM members), wipefs listing per whole disk (no -a: lists signatures, never erases) and the /dev paths
+ * that this node's guest configs pass through. Every tool is guarded; a missing one returns ''.
+ *
+ * @return array<string,mixed>
+ */
+function nexovirt_read_disks(): array
+{
+    if (getenv('NEXOVIRT_AGENT_DRYRUN') === '1') {
+        return [
+            'lsblk'       => '{"blockdevices":[{"name":"sdb","path":"/dev/sdb","type":"disk","size":1000204886016,"fstype":null,"pttype":null,"mountpoints":[null]}]}',
+            'findmnt'     => '{"filesystems":[{"target":"/","source":"/dev/mapper/pve-root","fstype":"ext4"}]}',
+            'pvs'         => '',
+            'wipefs'      => ['/dev/sdb' => ''],
+            'passthrough' => [],
+            'pci'         => [],
+            'usb'         => [],
+            'devices'     => ['/dev/sdb' => ['sys' => '/sys/devices/pci0000:00/0000:00:17.0/ata1/host0/target0:0:0/0:0:0:0/block/sdb', 'usb' => []]],
+            'busy'        => [],
+            'host_paths'  => [],
+            'zpool'       => ['pools' => []],
+            'tools'       => ['lsblk' => true, 'findmnt' => true, 'pvs' => true, 'wipefs' => true],
+        ];
+    }
+
+    $run = static fn (string $cmd): string => nexovirt_cap_output(nexovirt_run_cmd($cmd), DISK_OUTPUT_CAP);
+    $tools = [];
+    foreach (['lsblk', 'findmnt', 'pvs', 'wipefs'] as $bin) {
+        $tools[$bin] = nexovirt_bin_installed($bin);
+    }
+
+    $lsblk = $tools['lsblk']
+        ? $run('lsblk -J -b -o NAME,KNAME,PATH,PKNAME,TYPE,SIZE,FSTYPE,PTTYPE,LABEL,UUID,PARTUUID,MOUNTPOINTS,MODEL,SERIAL,ROTA,TRAN 2>/dev/null')
+        : '';
+    $findmnt = $tools['findmnt'] ? $run('findmnt -J -l -o TARGET,SOURCE,FSTYPE 2>/dev/null') : '';
+    $pvs     = $tools['pvs'] ? nexovirt_lvm_json($run('LVM_SUPPRESS_FD_WARNINGS=1 pvs --reportformat json -o pv_name,vg_name 2>/dev/null')) : '';
+
+    // wipefs per whole disk: paths come from the local lsblk output and must match DISK_PATH_RE.
+    $wipefs  = [];
+    $decoded = json_decode($lsblk, true);
+    if ($tools['wipefs'] && is_array($decoded['blockdevices'] ?? null)) {
+        foreach ($decoded['blockdevices'] as $dev) {
+            $path = is_array($dev) ? (string) ($dev['path'] ?? '') : '';
+            if (($dev['type'] ?? '') !== 'disk' || ! preg_match(DISK_PATH_RE, $path) || count($wipefs) >= 64) {
+                continue;
+            }
+            // Exit code appended: a wipefs that failed or timed out (no rc line) is reported as "error".
+            $raw = rtrim($run('wipefs -n -J ' . escapeshellarg($path) . ' 2>/dev/null; echo "rc=$?"'));
+            $ok  = preg_match('/(?:^|\n)rc=0$/', $raw) === 1;
+            $wipefs[$path] = $ok ? trim((string) preg_replace('/(?:^|\n)rc=0$/', '', $raw)) : 'error';
+        }
+    }
+
+    // Open files per local mount (fuser -m: rc 0 = in use, 1 = free). Missing fuser = no entries = unknown.
+    $busy = [];
+    $fm   = json_decode($findmnt, true);
+    if (nexovirt_bin_installed('fuser') && is_array($fm['filesystems'] ?? null)) {
+        foreach ($fm['filesystems'] as $f) {
+            $t = is_array($f) ? (string) ($f['target'] ?? '') : '';
+            if (! in_array((string) ($f['fstype'] ?? ''), DISK_LOCAL_FS, true) || ! nexovirt_mount_target_ok($t)
+                || $t === '/' || $t === '/boot' || str_starts_with($t, '/boot/') || count($busy) >= 64) {
+                continue;
+            }
+            [$rc] = nexovirt_run_rc('fuser -m ' . escapeshellarg($t) . ' >/dev/null 2>&1', 5);
+            if ($rc === 0 || $rc === 1) {
+                $busy[$t] = $rc === 0;
+            }
+        }
+    }
+
+    // Controller chain per whole disk (PCI addresses, USB devices) for the passthrough check.
+    $devices = [];
+    foreach (array_keys($wipefs) as $path) {
+        $devices[$path] = nexovirt_disk_sysfs($path);
+    }
+
+    $guest = nexovirt_guest_refs();
+    $zpool = nexovirt_zpool_read();
+
+    return [
+        'lsblk'       => $lsblk,
+        'findmnt'     => $findmnt,
+        'pvs'         => $pvs,
+        'wipefs'      => $wipefs,
+        'passthrough' => $guest['devs'],
+        'host_paths'  => $guest['paths'],
+        'pci'         => $guest['pci'],
+        'usb'         => $guest['usb'],
+        'zpool'       => $zpool,
+        'devices'     => $devices,
+        'busy'        => $busy,
+        'tools'       => $tools,
+    ];
+}
+
+/**
+ * Plan the erase of one whole disk (pure). The panel sends what it showed the admin (device, serial,
+ * mounts, VGs, pools); the agent re-derives everything from its OWN live read ($live, see
+ * nexovirt_disk_erase_read) and refuses when anything differs or is in use: serial changed, system disk,
+ * any device-mapper / md holder or child (LVM, LUKS, multipath, RAID), an imported ZFS pool on it, a VG /
+ * pool / path that is a Proxmox storage (unreadable storage.cfg = refuse), a guest using the disk, one of
+ * its partitions or a path on its mounts, controller / USB passthrough, an open-file or unchecked mount.
+ *
+ * @param array<string,mixed> $req  {device, serial, mounts[], vgs[], pools[]}
+ * @param array<string,mixed> $live
+ * @return array{ok: bool, error: string, cmds: list<string>, umount: list<string>, devs: list<string>}
+ */
+function nexovirt_disk_erase_plan(array $req, array $live): array
+{
+    $fail = static fn (string $e): array => ['ok' => false, 'error' => $e, 'cmds' => [], 'umount' => [], 'devs' => []];
+    $dev  = is_array($live['dev'] ?? null) ? $live['dev'] : [];
+    $path = (string) ($dev['path'] ?? '');
+    if ($path !== (string) ($req['device'] ?? '') || ! preg_match(DISK_PATH_RE, $path) || ($dev['type'] ?? '') !== 'disk') {
+        return $fail('the device is not the requested whole disk');
+    }
+    if (trim((string) ($dev['serial'] ?? '')) === '' || trim((string) ($dev['serial'] ?? '')) !== (string) ($req['serial'] ?? '')) {
+        return $fail('the disk serial changed');
+    }
+    $cfg = $live['storage_cfg'] ?? null;
+    if (! is_string($cfg) || trim($cfg) === '') {
+        return $fail('Storage configuration could not be read');
+    }
+    if (! is_array($live['pvs'] ?? null)) {
+        return $fail('LVM could not be checked');
+    }
+    if (! is_array($live['zpool']['pools'] ?? null)) {
+        return $fail('ZFS pools could not be checked');
+    }
+    if (! is_array($live['sysfs'] ?? null) || ! is_string($live['sysfs']['sys'] ?? null)) {
+        return $fail('The disk controller could not be checked');
+    }
+
+    // Walk: only the disk and its partitions may exist. Any other node is a device-mapper / md user.
+    $parts  = [];
+    $devs   = [];
+    $own    = [];
+    $labels = [];
+    $knames = [];
+    $stack  = [[$dev, 0]];
+    while ($stack !== []) {
+        [$n, $depth] = array_pop($stack);
+        $type = (string) ($n['type'] ?? '');
+        if (! in_array($type, ['disk', 'part'], true)) {
+            return $fail('Used by device mapper (' . $type . ')');
+        }
+        $devs[] = (string) ($n['path'] ?? '');
+        if ((string) ($n['kname'] ?? '') !== '') {
+            $devs[]   = '/dev/' . $n['kname'];
+            $knames[] = (string) $n['kname'];
+        }
+        if ($type === 'part') {
+            $parts[] = [(string) $n['path'], $depth];
+        }
+        if (($n['fstype'] ?? '') === 'zfs_member') {
+            $labels[(string) ($n['label'] ?? '')] = (string) $n['path'];
+        }
+        foreach ((array) ($n['mountpoints'] ?? []) as $mp) {
+            if (! is_string($mp) || $mp === '') {
+                continue;
+            }
+            if ($mp === '/' || $mp === '[SWAP]' || $mp === '/boot' || str_starts_with($mp, '/boot/')) {
+                return $fail('this is the system disk');
+            }
+            $own[] = $mp;
+        }
+        foreach ((array) ($n['children'] ?? []) as $c) {
+            if (is_array($c)) {
+                $stack[] = [$c, $depth + 1];
+            }
+        }
+    }
+    $devs = array_values(array_unique(array_filter($devs)));
+    foreach ($knames as $k) {
+        $holders = (array) (($live['holders'] ?? [])[$k] ?? ['?']);
+        if ($holders !== []) {
+            return $fail('Used by device mapper (' . implode(', ', $holders) . ')');
+        }
+    }
+
+    $vgs = [];
+    foreach ($devs as $p) {
+        if (isset($live['pvs'][$p])) {
+            $vgs[$live['pvs'][$p]] = true;
+        }
+    }
+    $vgs   = array_keys($vgs);
+    $pools = array_values(array_filter(array_keys($labels), static fn ($l) => $l !== ''));
+    $same  = static function (array $a, array $b): bool {
+        sort($a);
+        sort($b);
+        return array_values(array_unique($a)) === array_values(array_unique($b));
+    };
+    if (! $same($own, (array) ($req['mounts'] ?? [])) || ! $same($vgs, (array) ($req['vgs'] ?? [])) || ! $same($pools, (array) ($req['pools'] ?? []))) {
+        return $fail('the disk changed since the panel read it');
+    }
+    if (in_array('pve', $vgs, true)) {
+        return $fail('this is the system disk');
+    }
+    foreach ($live['zpool']['pools'] as $name => $vdevs) {
+        if (array_intersect((array) $vdevs, $devs) !== []) {
+            return $fail('ZFS pool ' . $name . ' is imported: export it by hand first');
+        }
+    }
+
+    // Proxmox storages.
+    foreach (preg_split('/\R/', $cfg) ?: [] as $line) {
+        if (! preg_match('/^\s+(vgname|pool|path)\s+(\S+)/', $line, $mm)) {
+            continue;
+        }
+        $v = rtrim($mm[2], '/');
+        if ($mm[1] === 'vgname' && in_array($v, $vgs, true)) {
+            return $fail('volume group ' . $v . ' is a Proxmox storage');
+        }
+        if ($mm[1] === 'pool' && in_array(explode('/', $v)[0], $pools, true)) {
+            return $fail('pool ' . $v . ' is a Proxmox storage');
+        }
+        if ($mm[1] === 'path') {
+            // Also the resolved path: a storage path that is a symlink into one of the disk's mounts.
+            foreach (array_unique([$v, (string) (($live['storage_real'] ?? [])[$v] ?? $v)]) as $sv) {
+                foreach ($own as $t) {
+                    if ($sv === $t || str_starts_with($sv, $t . '/') || str_starts_with($t, $sv . '/')) {
+                        return $fail($t . ' is a Proxmox storage path');
+                    }
+                }
+            }
+        }
+    }
+
+    // Guests: the disk or a partition by any /dev path, a host path on its mounts, its controller / USB device.
+    $guest = is_array($live['guest'] ?? null) ? $live['guest'] : null;
+    if ($guest === null) {
+        return $fail('guest configs could not be read');
+    }
+    foreach ((array) ($guest['devs'] ?? []) as $g) {
+        if (in_array((string) ($g['dev'] ?? ''), $devs, true) || in_array((string) ($g['ref'] ?? ''), $devs, true)) {
+            return $fail('Used by guest ' . (int) ($g['vmid'] ?? 0));
+        }
+    }
+    foreach ((array) ($guest['paths'] ?? []) as $g) {
+        foreach ($own as $t) {
+            $gp = (string) ($g['path'] ?? '');
+            if ($gp === $t || str_starts_with($gp, rtrim($t, '/') . '/')) {
+                return $fail('Used by guest ' . (int) ($g['vmid'] ?? 0) . ' (' . $gp . ')');
+            }
+        }
+    }
+    preg_match_all('/[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]/', strtolower($live['sysfs']['sys']), $am);
+    foreach ((array) ($guest['pci'] ?? []) as $g) {
+        foreach ($am[0] as $addr) {
+            $id = strtolower((string) ($g['id'] ?? ''));
+            $id = preg_match('/^[0-9a-f]{2}:[0-9a-f]{2}/', $id) ? '0000:' . $id : $id;
+            if ($id !== '' && (str_contains($id, '.') ? $addr === $id : str_starts_with($addr, $id . '.'))) {
+                return $fail('Passed through to a guest');
+            }
+        }
+    }
+    foreach ((array) ($guest['usb'] ?? []) as $g) {
+        foreach ((array) ($live['sysfs']['usb'] ?? []) as $u) {
+            if ((string) ($g['id'] ?? '') !== '' && in_array((string) $g['id'], [(string) ($u['id'] ?? ''), (string) ($u['port'] ?? '')], true)) {
+                return $fail('Passed through to a guest');
+            }
+        }
+    }
+
+    // Open files on every own mount.
+    foreach ($own as $t) {
+        if (! array_key_exists($t, (array) ($live['busy'] ?? []))) {
+            return $fail('open files on ' . $t . ' could not be checked');
+        }
+        if ($live['busy'][$t]) {
+            return $fail($t . ' is in use (open files)');
+        }
+    }
+
+    // Commands, in order. Deepest mounts and partitions first. Leftover ZFS labels: labelclear, never export.
+    $bins = (array) ($live['bins'] ?? []);
+    usort($own, static fn ($a, $b) => strlen($b) <=> strlen($a));
+    usort($parts, static fn ($a, $b) => $b[1] <=> $a[1] ?: strcmp($b[0], $a[0]));
+    $cmds = [];
+    foreach ($own as $t) {
+        $cmds[] = 'umount ' . escapeshellarg($t);
+    }
+    if (! empty($bins['zpool'])) {
+        foreach ($labels as $labelPath) {
+            $cmds[] = 'zpool labelclear -f ' . escapeshellarg($labelPath);
+        }
+    }
+    foreach ($parts as [$p]) {
+        $cmds[] = 'wipefs -a ' . escapeshellarg($p);
+    }
+    $cmds[] = 'wipefs -a ' . escapeshellarg($path);
+    if (! empty($bins['sgdisk'])) {
+        $cmds[] = 'sgdisk --zap-all ' . escapeshellarg($path);
+    }
+    if (! empty($bins['partprobe'])) {
+        $cmds[] = 'partprobe ' . escapeshellarg($path);
+    }
+    if (! empty($bins['udevadm'])) {
+        $cmds[] = 'udevadm settle';
+    }
+
+    return ['ok' => true, 'error' => '', 'cmds' => $cmds, 'umount' => $own, 'devs' => $devs];
+}
+
+/** fstab field with its octal escapes decoded (\040 = space). Pure. */
+function nexovirt_fstab_field(string $f): string
+{
+    return (string) preg_replace_callback('/\\\\([0-7]{3})/', static fn ($m) => chr(octdec($m[1])), $f);
+}
+
+/** True when $path is one of $roots or below one. */
+function nexovirt_path_under(string $path, array $roots): bool
+{
+    foreach ($roots as $r) {
+        if ($path === $r || str_starts_with($path, rtrim($r, '/') . '/')) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * /etc/fstab with the lines of the erased disk commented out (pure). A line goes when
+ *  - its spec RESOLVES to the disk or a partition ($devs): UUID= / LABEL= / PARTUUID= / PARTLABEL= by $tag (blkid;
+ *    exactly one device or refuse with the line), /dev paths by $real (readlink -f); text alone never matches;
+ *  - its mount target is one of the disk's mount points ($own), or below one;
+ *  - its spec is a path on one of those mounts (bind mounts, loop / image files).
+ * Afterwards no active line may still point at or into the disk's mounts.
+ *
+ * @param list<string> $devs
+ * @param list<string> $own
+ * @param callable(string,string):(list<string>|null) $tag
+ * @param callable(string):(string|null)                $real
+ * @return array{ok: bool, error: string, text: string, n: int}
+ */
+function nexovirt_fstab_plan(string $fstab, array $devs, callable $tag, callable $real, string $stamp, array $own = []): array
+{
+    $refuse = static fn (string $e): array => ['ok' => false, 'error' => $e, 'text' => '', 'n' => 0];
+    $out    = [];
+    $n      = 0;
+    foreach (preg_split('/(?<=\n)/', $fstab) ?: [] as $line) {
+        $trim   = ltrim($line);
+        $fields = preg_split('/\s+/', trim($trim)) ?: [];
+        $spec   = nexovirt_fstab_field($fields[0] ?? '');
+        $target = nexovirt_fstab_field($fields[1] ?? '');
+        if ($trim === '' || $trim[0] === '#' || $spec === '') {
+            $out[] = $line;
+            continue;
+        }
+        $mine = false;
+        if (preg_match('/^(UUID|LABEL|PARTUUID|PARTLABEL)=(.+)$/', $spec, $m)) {
+            $found = $tag($m[1], trim($m[2], '"'));
+            if ($found === null || count($found) !== 1) {
+                return $refuse('fstab line could not be resolved to one device: ' . trim($line));
+            }
+            $mine = in_array($found[0], $devs, true);
+        } elseif (str_starts_with($spec, '/dev/')) {
+            $mine = in_array((string) $real($spec), $devs, true);
+        }
+        if (! $mine && $own !== []) {
+            $mine = nexovirt_path_under($target, $own)
+                || (str_starts_with($spec, '/') && ! str_starts_with($spec, '/dev/') && nexovirt_path_under($spec, $own));
+        }
+        if ($mine) {
+            $out[] = '# nexovirt-erased ' . $stamp . ': ' . $line;
+            $n++;
+        } else {
+            $out[] = $line;
+        }
+    }
+    $text = implode('', $out);
+
+    // Check the result: nothing active may still use the disk's mounts.
+    foreach (preg_split('/\R/', $text) ?: [] as $line) {
+        $t = ltrim($line);
+        if ($t === '' || $t[0] === '#') {
+            continue;
+        }
+        $f = preg_split('/\s+/', trim($t)) ?: [];
+        if (nexovirt_path_under(nexovirt_fstab_field($f[1] ?? ''), $own)
+            || (str_starts_with($f[0] ?? '', '/') && nexovirt_path_under(nexovirt_fstab_field($f[0]), $own))) {
+            return $refuse('fstab would still use the disk: ' . trim($line));
+        }
+    }
+
+    return ['ok' => true, 'error' => '', 'text' => $text, 'n' => $n];
+}
+
+/** Errors findmnt --verify reports ("N parse errors, M errors, K warnings"). Pure. */
+function nexovirt_verify_errors(string $out): int
+{
+    $n = 0;
+    foreach (['/([0-9]+) parse errors?/', '/([0-9]+) errors?/'] as $re) {
+        if (preg_match($re, $out, $m)) {
+            $n += (int) $m[1];
+        }
+    }
+
+    return $n;
+}
+
+/** Run a command, return [exit code, output]. A missing rc line (timeout) counts as a failure. */
+function nexovirt_run_rc(string $cmd, int $timeoutSec = 120): array
+{
+    $out = rtrim(nexovirt_run_cmd($cmd . '; echo "rc=$?"', $timeoutSec));
+    if (! preg_match('/(?:^|\n)rc=([0-9]+)$/', $out, $m)) {
+        return [124, $out];
+    }
+
+    return [(int) $m[1], trim((string) preg_replace('/(?:^|\n)rc=[0-9]+$/', '', $out))];
+}
+
+/**
+ * disk_erase job: validate, read live, plan, resolve + verify the fstab change BEFORE anything runs, then run
+ * every step checked (abort on the first failure, nothing after it runs), write fstab after the unmounts
+ * (backup first, atomic), and re-read: the disk must be empty.
+ * Seams: $run(cmd) => [rc, out], $read(device) => live facts, $fs = ['read', 'verify', 'write', 'tag', 'real'].
+ *
+ * @return array{ok: bool, error: string, log: list<string>}
+ */
+function nexovirt_disk_erase(array $p, ?callable $run = null, ?callable $read = null, ?array $fs = null): array
+{
+    $run  ??= 'nexovirt_run_rc';
+    $log  = [];
+    $fail = static function (string $e) use (&$log): array {
+        return ['ok' => false, 'error' => $e, 'log' => $log];
+    };
+    $device = is_string($p['device'] ?? null) ? $p['device'] : '';
+    $serial = is_string($p['serial'] ?? null) ? $p['serial'] : '';
+    $lists  = [];
+    foreach (['mounts', 'vgs', 'pools'] as $k) {
+        $v = $p[$k] ?? [];
+        if (! is_array($v) || count($v) > 32) {
+            return $fail('invalid ' . $k);
+        }
+        foreach ($v as $item) {
+            $ok = is_string($item) && match ($k) {
+                'mounts' => nexovirt_mount_target_ok($item),
+                'vgs'    => preg_match('/^[A-Za-z0-9+_.-]{1,127}$/', $item) === 1,
+                default  => preg_match('/^[A-Za-z][A-Za-z0-9_.:-]{0,254}$/', $item) === 1,
+            };
+            if (! $ok) {
+                return $fail('invalid ' . $k);
+            }
+        }
+        $lists[$k] = array_values($v);
+    }
+    if (! preg_match(DISK_PATH_RE, $device) || $serial === '' || strlen($serial) > 128 || preg_match('/^[A-Za-z0-9 ._:-]+$/', $serial) !== 1) {
+        return $fail('invalid device or serial');
+    }
+
+    $read ??= 'nexovirt_disk_erase_read';
+    $live   = $read($device);
+    if (! is_array($live) || ! is_array($live['dev'] ?? null)) {
+        return $fail('the disk could not be read');
+    }
+    $plan = nexovirt_disk_erase_plan(['device' => $device, 'serial' => $serial] + $lists, $live);
+    if (! $plan['ok']) {
+        return $fail('refused: ' . $plan['error']);
+    }
+
+    $fs ??= nexovirt_fstab_io();
+    $text = $fs['read']();
+    if (! is_string($text)) {
+        return $fail('/etc/fstab could not be read');
+    }
+    $stamp = date('Ymd-His');
+    $ft    = nexovirt_fstab_plan($text, $plan['devs'], $fs['tag'], $fs['real'], $stamp, $plan['umount']);
+    if (! $ft['ok']) {
+        return $fail('refused: ' . $ft['error']);
+    }
+    if ($ft['n'] > 0 && ! $fs['verify']($ft['text'], $text)) {
+        return $fail('refused: the changed /etc/fstab did not pass findmnt --verify');
+    }
+
+    $umounts = count($plan['umount']);
+    foreach ($plan['cmds'] as $i => $cmd) {
+        if ($i === $umounts && $ft['n'] > 0) {
+            if (! $fs['write']($ft['text'], $stamp)) {
+                return $fail('/etc/fstab could not be updated');
+            }
+            $log[] = 'fstab: ' . $ft['n'] . ' line(s) commented out, backup /etc/fstab.nexovirt-' . $stamp;
+        }
+        [$rc, $out] = $run($cmd);
+        $log[] = $cmd . ' => ' . $rc;
+        if ($rc !== 0) {
+            return $fail('step failed: ' . $cmd . ($out !== '' ? ' (' . substr($out, 0, 300) . ')' : ''));
+        }
+    }
+
+    $after = $read($device);
+    $d     = is_array($after['dev'] ?? null) ? $after['dev'] : null;
+    if ($d === null || ! empty($d['children']) || (string) ($d['fstype'] ?? '') !== '' || (string) ($d['pttype'] ?? '') !== '' || ($after['signatures'] ?? null) !== []) {
+        return $fail('the disk is not empty after the erase');
+    }
+    $log[] = 'disk is empty';
+
+    return ['ok' => true, 'error' => '', 'log' => $log];
+}
+
+/** The real /etc/fstab I/O for the erase: read, blkid tag lookup, readlink -f, findmnt verify, backup + atomic write. */
+function nexovirt_fstab_io(): array
+{
+    return [
+        'read' => static fn (): string|false => @file_get_contents('/etc/fstab'),
+        'tag'  => static function (string $type, string $value): ?array {
+            if (! nexovirt_bin_installed('blkid')) {
+                return null;
+            }
+            [$rc, $out] = nexovirt_run_rc('blkid -t ' . escapeshellarg($type . '=' . $value) . ' -o device 2>/dev/null', 30);
+            if ($rc !== 0 && $rc !== 2) {
+                return null;
+            }
+            $devs = [];
+            foreach (preg_split('/\R/', $out) ?: [] as $d) {
+                $d = trim($d);
+                if ($d !== '') {
+                    $r      = @realpath($d);
+                    $devs[] = is_string($r) ? $r : $d;
+                }
+            }
+
+            return array_values(array_unique($devs));
+        },
+        'real' => static function (string $path): ?string {
+            $r = @realpath($path);
+            return is_string($r) ? $r : null;
+        },
+        'verify' => static function (string $new, string $old): bool {
+            if (! nexovirt_bin_installed('findmnt')) {
+                return true;
+            }
+            $check = static function (string $text): ?array {
+                $tmp = '/run/nexovirt-fstab-check-' . bin2hex(random_bytes(6));
+                if (@file_put_contents($tmp, $text) !== strlen($text)) {
+                    @unlink($tmp);
+                    return null;
+                }
+                [$rc, $out] = nexovirt_run_rc('findmnt --verify --tab-file ' . escapeshellarg($tmp) . ' 2>&1', 30);
+                @unlink($tmp);
+                return [$rc, nexovirt_verify_errors($out)];
+            };
+            $n = $check($new);
+            if ($n === null) {
+                return false;
+            }
+            if ($n[0] === 0) {
+                return true;
+            }
+            // The current table already fails: the new one may fail too, but with no more errors.
+            $o = $check($old);
+
+            return $o !== null && $o[0] !== 0 && $n[1] <= $o[1];
+        },
+        'write' => static function (string $text, string $stamp): bool {
+            $target = @realpath('/etc/fstab');
+            if (! is_string($target)) {
+                return false;
+            }
+            $backup = '/etc/fstab.nexovirt-' . $stamp;
+            if (file_exists($backup) || ! @copy($target, $backup)) {
+                return false;
+            }
+            $dir  = dirname($target);
+            $tmp  = $dir . '/.fstab.nexovirt-' . bin2hex(random_bytes(6));
+            $mode = @fileperms($target);
+            $uid  = @fileowner($target);
+            $gid  = @filegroup($target);
+            $fh   = @fopen($tmp, 'xb');
+            if ($fh === false) {
+                return false;
+            }
+            $ok = fwrite($fh, $text) === strlen($text) && fflush($fh) && (! function_exists('fsync') || fsync($fh));
+            fclose($fh);
+            $ok = $ok && @chmod($tmp, $mode !== false ? ($mode & 07777) : 0644)
+                && ($uid === false || @chown($tmp, $uid)) && ($gid === false || @chgrp($tmp, $gid))
+                && @rename($tmp, $target);
+            if (! $ok) {
+                @unlink($tmp);
+                return false;
+            }
+            nexovirt_run_rc('sync ' . escapeshellarg($dir), 30); // the directory entry too
+
+            return true;
+        },
+    ];
+}
+
+/** Live facts for one disk (read-only): lsblk node, holders, mounts, PVs, storage.cfg, guests, sysfs, pools, open files. */
+function nexovirt_disk_erase_read(string $device): ?array
+{
+    $j = json_decode(nexovirt_run_cmd('lsblk -J -b -o NAME,KNAME,PATH,TYPE,FSTYPE,PTTYPE,LABEL,UUID,PARTUUID,MOUNTPOINTS,SERIAL ' . escapeshellarg($device) . ' 2>/dev/null'), true);
+    $dev = $j['blockdevices'][0] ?? null;
+    if (! is_array($dev)) {
+        return null;
+    }
+    $holders = [];
+    $own     = [];
+    $stack   = [$dev];
+    while ($stack !== []) {
+        $n = array_pop($stack);
+        if ((string) ($n['kname'] ?? '') !== '') {
+            $holders[(string) $n['kname']] = nexovirt_block_holders((string) $n['kname']);
+        }
+        foreach ((array) ($n['mountpoints'] ?? []) as $mp) {
+            if (is_string($mp) && nexovirt_mount_target_ok($mp)) {
+                $own[] = $mp;
+            }
+        }
+        foreach ((array) ($n['children'] ?? []) as $c) {
+            if (is_array($c)) {
+                $stack[] = $c;
+            }
+        }
+    }
+    $fm     = json_decode(nexovirt_run_cmd('findmnt -J -l -o TARGET,SOURCE,FSTYPE 2>/dev/null'), true);
+    $mounts = [];
+    foreach ((array) ($fm['filesystems'] ?? []) as $f) {
+        $mounts[] = ['target' => (string) ($f['target'] ?? ''), 'source' => (string) ($f['source'] ?? ''), 'fstype' => (string) ($f['fstype'] ?? '')];
+    }
+    $pvVg = null;
+    if (nexovirt_bin_installed('pvs')) {
+        [$prc, $pout] = nexovirt_run_rc('LVM_SUPPRESS_FD_WARNINGS=1 pvs --reportformat json -o pv_name,vg_name 2>/dev/null', 30);
+        $pj = $prc === 0 ? json_decode(nexovirt_lvm_json((string) $pout), true) : null;
+        if (is_array($pj['report'] ?? null)) {
+            $pvVg = [];
+            foreach ((array) ($pj['report'][0]['pv'] ?? []) as $pv) {
+                if ((string) ($pv['vg_name'] ?? '') !== '') {
+                    $pvVg[(string) $pv['pv_name']] = (string) $pv['vg_name'];
+                }
+            }
+        }
+    }
+    // Open files: only the disk's own mounts.
+    $busy = [];
+    if (nexovirt_bin_installed('fuser')) {
+        foreach (array_unique($own) as $t) {
+            [$rc] = nexovirt_run_rc('fuser -m ' . escapeshellarg($t) . ' >/dev/null 2>&1', 30);
+            if ($rc === 0 || $rc === 1) {
+                $busy[$t] = $rc === 0;
+            }
+        }
+    }
+    [$wrc, $wout] = nexovirt_run_rc('wipefs -n -J ' . escapeshellarg($device) . ' 2>/dev/null', 30);
+    $sig = null;
+    if ($wrc === 0) {
+        $wj  = $wout === '' ? ['signatures' => []] : json_decode($wout, true);
+        $sig = is_array($wj['signatures'] ?? null) ? $wj['signatures'] : null;
+    }
+    $cfg  = @file_get_contents('/etc/pve/storage.cfg');
+    $real = [];
+    foreach (preg_split('/\R/', is_string($cfg) ? $cfg : '') ?: [] as $line) {
+        if (preg_match('/^\s+path\s+(\S+)/', $line, $mm)) {
+            $r = @realpath($mm[1]);
+            $real[rtrim($mm[1], '/')] = is_string($r) ? $r : rtrim($mm[1], '/');
+        }
+    }
+
+    return [
+        'storage_real' => $real,
+        'dev'         => $dev,
+        'holders'     => $holders,
+        'mounts'      => $mounts,
+        'pvs'         => $pvVg,
+        'storage_cfg' => is_string($cfg) ? $cfg : null,
+        'guest'       => nexovirt_guest_refs(),
+        'sysfs'       => nexovirt_disk_sysfs($device),
+        'zpool'       => nexovirt_zpool_read(),
+        'busy'        => $busy,
+        'bins'        => ['sgdisk' => nexovirt_bin_installed('sgdisk'), 'partprobe' => nexovirt_bin_installed('partprobe'),
+            'udevadm' => nexovirt_bin_installed('udevadm'), 'zpool' => nexovirt_bin_installed('zpool')],
+        'signatures'  => $sig,
+    ];
+}
+
 /**
  * Read recent IMPORTANT system log entries. Read-only, no parameters. Prefers journalctl
  * (priority "error" and above: the actionable noise), falling back to the tail of the
@@ -7613,6 +8619,26 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
         // Read-only, no parameters → no injection surface.
         $pve = nexovirt_read_pve();
         return ['id' => $id, 'ok' => true, 'result' => nexovirt_json($pve)];
+    }
+
+    if ($type === 'disk_erase') {
+        // DESTRUCTIVE: wipes one whole disk after the agent's own live re-check (see nexovirt_disk_erase_plan).
+        $r = nexovirt_disk_erase($p);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['ok'] ? nexovirt_json($r) : $r['error'] . ($r['log'] !== [] ? ' | ' . implode('; ', $r['log']) : '')];
+    }
+
+    if ($type === 'path_check') {
+        // Read-only: is this absolute, normalized path an existing directory on the node?
+        $path = is_string($p['path'] ?? null) ? $p['path'] : '';
+        if (! nexovirt_mount_target_ok($path) || $path === '/' || str_contains($path, '//') || str_ends_with($path, '/') || str_contains($path, '/./')) {
+            return ['id' => $id, 'ok' => false, 'result' => 'invalid path'];
+        }
+        return ['id' => $id, 'ok' => true, 'result' => nexovirt_json(['path' => $path, 'exists' => is_dir($path)])];
+    }
+
+    if ($type === 'read_disks') {
+        // Read-only, no parameters -> no injection surface.
+        return ['id' => $id, 'ok' => true, 'result' => nexovirt_json(nexovirt_read_disks())];
     }
 
     if ($type === 'read_logs') {
