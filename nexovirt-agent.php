@@ -29,7 +29,7 @@
 
 declare(strict_types=1);
 
-const AGENT_VERSION        = '0.34.1';
+const AGENT_VERSION        = '0.35.1';
 const DEFAULT_INTERVAL     = 15;
 const CONNECT_TIMEOUT      = 10;   // seconds for connection
 const REQUEST_TIMEOUT      = 30;   // seconds for full request
@@ -928,6 +928,7 @@ function nexovirt_delete_image(string $filename, string $content = 'iso'): array
     $dir = $isTemplate ? nexovirt_images_vztmpl_dir() : nexovirt_images_iso_dir();
     if (! $isTemplate) {
         nexovirt_image_cache_forget($filename); // a cached image: stop its download, drop its state
+        nexovirt_image_import_unlink($filename);
     }
     @unlink(rtrim($dir, '/') . '/' . $filename);
     @unlink(rtrim($dir, '/') . '/' . $filename . '.part');
@@ -1145,6 +1146,7 @@ function nexovirt_image_cache_run(string $filename, ?callable $runner = null): a
         return ['ok' => false, 'result' => $err];
     }
     $size = (int) @filesize($final);
+    nexovirt_image_import_link($filename);
     nexovirt_image_state_write($filename, ['state' => 'ready', 'size' => $size, 'sha256' => $sha, 'finished_at' => time()]);
     @unlink(nexovirt_image_state_dir() . '/' . $filename . '.spec');
     return ['ok' => true, 'result' => 'ready ' . $size . ' bytes'];
@@ -1205,6 +1207,9 @@ function nexovirt_images_report(): array
         if ($st === 'ready' && ! is_file($file)) {
             [$st, $err] = ['error', 'the image file is missing on the node'];
         }
+        if ($st === 'ready') {
+            nexovirt_image_import_link($name); // images cached before 0.35.1 get their import link here
+        }
         $part = $file . '.part';
         $out[] = [
             'name'   => $name,
@@ -1217,6 +1222,62 @@ function nexovirt_images_report(): array
         ];
     }
     return $out;
+}
+
+/** The managed storage's import directory (content `import`: usable by non-root sign-ins, unlike a file path). */
+function nexovirt_images_import_dir(): string
+{
+    $base = getenv('NEXOVIRT_IMAGES_DIR');
+    $base = $base !== false && $base !== '' ? $base : '/var/lib/nexovirt/images';
+    return rtrim($base, '/') . '/import';
+}
+
+/** Disk format by magic bytes: PVE takes an import volume's format from its extension, so it must be right. */
+function nexovirt_image_format(string $path): string
+{
+    $head = (string) @file_get_contents($path, false, null, 0, 4);
+    if ($head === "QFI\xfb") {
+        return 'qcow2';
+    }
+    return $head === 'KDMV' ? 'vmdk' : 'raw';
+}
+
+/**
+ * 0.35.1: a ready cache image also appears as <images>/import/<stem>.<format> (hard link, same file) so an API-token
+ * or other non-root connection can import it by volid; Proxmox refuses absolute import paths to everyone but root@pam.
+ * Returns the import file name or '' (not a cache image, an ISO, or the link failed).
+ */
+function nexovirt_image_import_link(string $filename): string
+{
+    if (! nexovirt_validate_cache_filename($filename) || strtolower((string) pathinfo($filename, PATHINFO_EXTENSION)) === 'iso') {
+        return '';
+    }
+    $src = nexovirt_images_iso_dir() . '/' . $filename;
+    if (! is_file($src)) {
+        return '';
+    }
+    $dir  = nexovirt_images_import_dir();
+    $name = substr($filename, 0, (int) strrpos($filename, '.')) . '.' . nexovirt_image_format($src);
+    $dst  = $dir . '/' . $name;
+    clearstatcache(true, $dst);
+    if (is_file($dst) && @fileinode($dst) === @fileinode($src)) {
+        return $name;
+    }
+    @mkdir($dir, 0755, true);
+    nexovirt_image_import_unlink($filename);
+    return (@link($src, $dst) || @symlink($src, $dst)) ? $name : '';
+}
+
+/** Remove the import links of a cache image (every format it may have had). */
+function nexovirt_image_import_unlink(string $filename): void
+{
+    if (! nexovirt_validate_cache_filename($filename)) {
+        return;
+    }
+    $stem = substr($filename, 0, (int) strrpos($filename, '.'));
+    foreach (['qcow2', 'raw', 'vmdk'] as $ext) {
+        @unlink(nexovirt_images_import_dir() . '/' . $stem . '.' . $ext);
+    }
 }
 
 /** Delete .part files untouched for IMAGE_PART_MAX_AGE that no live download owns. */
@@ -1564,7 +1625,538 @@ function nexovirt_guest_unlock(string $type, $vmid): array
     $code = 0;
     exec($cmd, $out, $code);
 
-    return ['ok' => $code === 0, 'result' => $code === 0 ? 'unlocked' : nexovirt_cap_output(implode("\n", $out))];
+    return ['ok' => $code === 0, 'result' => $code === 0 ? 'unlocked' : nexovirt_cap_output(implode("\n", $out), 2000)];
+}
+
+/*
+ * pve_root_config: settings Proxmox reserves for root@pam (an API token is refused), applied as root with pvesh.
+ * Only these keys, every value checked here (the panel is not trusted): LXC features flags, bind mounts (mpN with a
+ * host folder outside the node's system folders), QEMU hostpciN (PCI ids or a resource mapping), QEMU args only
+ * shrinking the current value. Deletes: lxc features/mpN, qemu args.
+ */
+const NEXOVIRT_BIND_FORBIDDEN_ROOTS = ['/etc', '/root', '/proc', '/sys', '/dev', '/run', '/boot', '/usr', '/bin', '/sbin', '/lib', '/lib64',
+    '/var/lib', '/var/log', '/var/www', '/home', '/opt/nexovirt-agent.php', '/mnt/pve', '/var/lib/vz'];
+const NEXOVIRT_BIND_FORBIDDEN_EXACT = ['/var', '/mnt', '/opt', '/srv', '/media', '/tmp'];
+
+function nexovirt_root_features_ok(string $v): bool
+{
+    $flags = explode(',', $v);
+    if ($v === '' || count($flags) > 6) {
+        return false;
+    }
+    foreach ($flags as $f) {
+        if (preg_match('/^(nesting|keyctl|fuse|mknod|force_rw_sys)=[01]$/', $f) === 1) {
+            continue;
+        }
+        if (preg_match('/^mount=(nfs|cifs)(;(nfs|cifs))?$/', $f) === 1) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+/** Folders of the node's PVE storages (dir/nfs/cifs paths and mountpoints): other guests' disks, never bind-mounted. */
+function nexovirt_pve_storage_paths(string $cfg = '/etc/pve/storage.cfg'): array
+{
+    $paths = [];
+    foreach (is_readable($cfg) ? (file($cfg, FILE_IGNORE_NEW_LINES) ?: []) : [] as $line) {
+        if (preg_match('#^\s+(path|mountpoint)\s+(/\S*)#', $line, $m) === 1) {
+            $paths[] = rtrim($m[2], '/');
+        }
+        // zfspool storages name a pool/dataset: its mountpoint holds the containers' root filesystems.
+        if (preg_match('#^\s+pool\s+([A-Za-z0-9_./-]+)#', $line, $m) === 1) {
+            $out = [];
+            $code = 0;
+            exec('zfs list -H -o mountpoint ' . escapeshellarg($m[1]) . ' 2>/dev/null', $out, $code);
+            $mp = trim((string) ($out[0] ?? ''));
+            if ($code === 0 && $mp !== '' && $mp[0] === '/') {
+                $paths[] = rtrim($mp, '/');
+            }
+        }
+    }
+    return $paths;
+}
+
+/**
+ * Folders under which bind mounts may come from: /srv, /mnt, /media, /data, /opt by default, plus one absolute folder per
+ * line in /etc/nexovirt/bind-roots (root-owned, kept by the node's admin). Everything else is refused.
+ */
+function nexovirt_bind_roots(string $file = '/etc/nexovirt/bind-roots'): array
+{
+    $roots = ['/srv', '/mnt', '/media', '/data', '/opt'];
+    foreach (is_readable($file) ? (file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: []) : [] as $line) {
+        $line = rtrim(trim($line), '/');
+        if (preg_match('#^/[A-Za-z0-9._/-]+$#', $line) === 1 && strpos($line, '..') === false) {
+            $roots[] = $line;
+        }
+    }
+    return $roots;
+}
+
+/** Host-path rule shared by the written and the resolved path. */
+function nexovirt_bind_path_allowed(string $norm, array $storagePaths, ?array $roots = null): bool
+{
+    if ($norm === '' || in_array($norm, NEXOVIRT_BIND_FORBIDDEN_EXACT, true)) {
+        return false;
+    }
+    $below = false;
+    foreach ($roots ?? nexovirt_bind_roots() as $r) {
+        if (strpos($norm, rtrim($r, '/') . '/') === 0) {
+            $below = true;
+        }
+    }
+    if (! $below) {
+        return false;
+    }
+    foreach (array_merge(NEXOVIRT_BIND_FORBIDDEN_ROOTS, $storagePaths) as $root) {
+        $root = rtrim((string) $root, '/');
+        if ($root === '' || $norm === $root || strpos($norm, $root . '/') === 0 || strpos($root, $norm . '/') === 0) {
+            return false; // the folder itself, anything below it, or a parent that contains it
+        }
+    }
+    return true;
+}
+
+/**
+ * $resolve maps a host path to its real path (symlinks followed) or null when it does not exist; the real path must pass
+ * the same rules, so a symlink cannot point a bind mount at a system folder or a storage.
+ */
+function nexovirt_root_bind_ok(string $v, ?callable $resolve = null, ?array $storagePaths = null, ?array $roots = null): bool
+{
+    $parts = explode(',', $v);
+    $host  = array_shift($parts);
+    $storagePaths = $storagePaths ?? nexovirt_pve_storage_paths();
+    $resolve = $resolve ?? static function (string $p): ?string {
+        $r = realpath($p);
+        return $r === false ? null : $r;
+    };
+    if (strlen($host) > 255 || preg_match('#^/[A-Za-z0-9._/-]+$#D', $host) !== 1 || strpos($host, '..') !== false || strpos($host, '//') !== false) {
+        return false;
+    }
+    $norm = rtrim($host, '/');
+    if (! nexovirt_bind_path_allowed($norm, $storagePaths, $roots)) {
+        return false;
+    }
+    $real = $resolve($host);
+    if ($real === null || ! nexovirt_bind_path_allowed(rtrim($real, '/'), $storagePaths, $roots)) {
+        return false; // missing folder, or a symlink into a forbidden place
+    }
+    $mp = false;
+    foreach ($parts as $o) {
+        if (preg_match('#^mp=/[A-Za-z0-9._/-]{0,250}$#D', $o) === 1 && strpos($o, '..') === false && strpos($o, '//') === false) {
+            $mp = true;
+            continue;
+        }
+        if (preg_match('/^(ro|backup|acl|quota|replicate|shared)=[01]$/', $o) === 1 || preg_match('/^mountoptions=[a-z]{2,10}(;[a-z]{2,10}){0,5}$/', $o) === 1) {
+            continue;
+        }
+        return false;
+    }
+    return $mp;
+}
+
+/**
+ * Why a PCI device (or every function of a slot) must stay with the node, or null. Refused: bridges, memory and system
+ * devices, disks holding mounted/used filesystems (incl. ZFS, LVM, RAID, swap), network interfaces that are up with an
+ * address or part of a bridge/bond. $run(cmd) -> [code, out]; $sys = sysfs root (tests).
+ */
+function nexovirt_pci_passthrough_refusal(string $id, ?callable $run = null, string $sys = '/sys'): ?string
+{
+    $run = $run ?? static function (string $cmd): array {
+        $out = [];
+        $code = 0;
+        exec($cmd, $out, $code);
+        return ['code' => $code, 'out' => implode("\n", $out)];
+    };
+    $id    = strtolower($id);
+    $slot  = preg_match('/\.[0-7]$/', $id) === 1 ? $id : $id . '.';
+    $funcs = array_values(array_filter(array_map('basename', glob($sys . '/bus/pci/devices/*') ?: []), static fn ($d) => strpos($d, $slot) === 0));
+    if ($funcs === []) {
+        return 'device not found on this node';
+    }
+    foreach ($funcs as $f) {
+        $class = strtolower(trim((string) @file_get_contents($sys . '/bus/pci/devices/' . $f . '/class')));
+        if (preg_match('/^0x0(5|6|8)/', $class) === 1) {
+            return $f . ' is a bridge or system device of the node';
+        }
+    }
+    foreach (glob($sys . '/block/*') ?: [] as $blk) {
+        $real = (string) realpath($blk);
+        foreach ($funcs as $f) {
+            if (strpos($real, '/' . $f . '/') === false) {
+                continue;
+            }
+            $lsblk = $run('lsblk -nro MOUNTPOINT,FSTYPE ' . escapeshellarg('/dev/' . basename($blk)) . ' 2>/dev/null');
+            foreach (explode("\n", (string) $lsblk['out']) as $line) {
+                $line = trim($line);
+                if ($line !== '' && preg_match('/(^\/|\[SWAP\]|zfs_member|LVM2_member|linux_raid_member|swap)/', $line) === 1) {
+                    return $f . ' holds a disk the node uses (' . basename($blk) . ')';
+                }
+            }
+        }
+    }
+    foreach (glob($sys . '/class/net/*') ?: [] as $net) {
+        $real = (string) realpath($net);
+        foreach ($funcs as $f) {
+            if (strpos($real, '/' . $f . '/') === false) {
+                continue;
+            }
+            $if = basename($net);
+            if (file_exists($net . '/master')) {
+                return $f . ' is a network port of the node (' . $if . ' is in a bridge or bond)';
+            }
+            $addr = $run('ip -o addr show dev ' . escapeshellarg($if) . ' 2>/dev/null');
+            if (trim((string) $addr['out']) !== '') {
+                return $f . ' is a network port of the node (' . $if . ' has an address)';
+            }
+        }
+    }
+    return null;
+}
+
+/** true when allowed, false for a malformed value, or the reason the node keeps the device. @return bool|string */
+function nexovirt_root_hostpci_ok(string $v, ?callable $refusal = null)
+{
+    $parts = explode(',', $v);
+    $dev   = (string) array_shift($parts);
+    if (strpos($dev, 'host=') === 0) {
+        $dev = substr($dev, 5);
+    }
+    $id = '[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}(\.[0-7])?';
+    if (preg_match('/^' . $id . '(;' . $id . '){0,7}$/', $dev) !== 1 && preg_match('/^mapping=[A-Za-z0-9_-]{1,64}$/', $dev) !== 1) {
+        return false;
+    }
+    foreach ($parts as $o) {
+        if (preg_match('/^(pcie|x-vga|rombar)=[01]$/', $o) !== 1 && preg_match('/^mapping=[A-Za-z0-9_-]{1,64}$/', $o) !== 1) {
+            return false;
+        }
+    }
+    if (strpos($dev, 'mapping=') === 0) {
+        return true; // a resource mapping is created by root in the cluster config
+    }
+    $refusal = $refusal ?? 'nexovirt_pci_passthrough_refusal';
+    foreach (explode(';', $dev) as $one) {
+        if (($why = $refusal($one)) !== null) {
+            return $why; // the reason, shown to the admin
+        }
+    }
+    return true;
+}
+
+/** "-a x -b -c y z" -> ["-a x", "-b", "-c y z"]: an option with the values that follow it. */
+function nexovirt_args_groups(string $args): array
+{
+    $groups = [];
+    foreach (preg_split('/\s+/', trim($args), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $t) {
+        if ($t[0] === '-' || $groups === []) {
+            $groups[] = $t;
+        } else {
+            $groups[count($groups) - 1] .= ' ' . $t;
+        }
+    }
+    return $groups;
+}
+
+/** $new is $current with whole option groups removed, order kept (e.g. the Virtualizor "-vnc ..." cleanup). */
+function nexovirt_root_args_shrinks(string $new, string $current): bool
+{
+    $want = nexovirt_args_groups($new);
+    $have = nexovirt_args_groups($current);
+    if ($want === [] || count($want) >= count($have)) {
+        return false;
+    }
+    $i = 0;
+    foreach ($have as $g) {
+        if ($i < count($want) && $want[$i] === $g) {
+            $i++;
+        }
+    }
+    return $i === count($want);
+}
+
+/**
+ * Checks a pve_root_config payload and builds the pvesh command. $currentArgs reads the guest's current QEMU args.
+ *
+ * @return array{ok:bool, error:string, cmd:string}
+ */
+function nexovirt_pve_root_config_cmd(array $p, string $selfNode, ?callable $currentArgs = null, ?callable $bindOk = null, ?callable $pciOk = null, ?callable $unprivileged = null): array
+{
+    $bindOk = $bindOk ?? 'nexovirt_root_bind_ok';
+    $pciOk  = $pciOk ?? 'nexovirt_root_hostpci_ok';
+    $bad  = static fn (string $why): array => ['ok' => false, 'error' => $why, 'cmd' => ''];
+    $type = (string) ($p['type'] ?? '');
+    $node = (string) ($p['node'] ?? '');
+    $vmid = is_int($p['vmid'] ?? null) ? (string) $p['vmid'] : (string) ($p['vmid'] ?? '');
+    $set  = is_array($p['set'] ?? null) ? $p['set'] : [];
+    $del  = is_array($p['delete'] ?? null) ? $p['delete'] : [];
+    if (! in_array($type, ['lxc', 'qemu'], true) || preg_match('/^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$/', $node) !== 1
+        || preg_match('/^[1-9][0-9]{2,8}$/', $vmid) !== 1 || ($set === [] && $del === []) || count($set) > 20 || count($del) > 20) {
+        return $bad('bad guest');
+    }
+    // Device and folder checks run here, so the change must land on this very node (never forwarded through the cluster).
+    if (strtolower($node) !== strtolower($selfNode)) {
+        return $bad('guest is on another node');
+    }
+    $cmd = 'pvesh set ' . escapeshellarg('/nodes/' . $node . '/' . $type . '/' . $vmid . '/config');
+    foreach ($set as $k => $v) {
+        $k = (string) $k;
+        if (! is_string($v) || strlen($v) > 1024 || preg_match('/[\x00-\x1f]/', $v) === 1) {
+            return $bad('bad value for ' . $k);
+        }
+        if ($type === 'lxc') {
+            $isMp = preg_match('/^mp([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/', $k) === 1;
+            if ($isMp && ($unprivileged === null || ! $unprivileged($node, $vmid))) {
+                return $bad('bind mounts need an unprivileged container');
+            }
+            $ok = ($k === 'features' && nexovirt_root_features_ok($v)) || ($isMp && $bindOk($v));
+        } elseif (preg_match('/^hostpci([0-9]|1[0-5])$/', $k) === 1) {
+            $ok = $pciOk($v);
+            if (is_string($ok)) {
+                return $bad($ok);
+            }
+        } elseif ($k === 'args') {
+            $ok = $currentArgs !== null && nexovirt_root_args_shrinks($v, (string) $currentArgs($node, $vmid));
+        } elseif ($k === 'lock') {
+            $ok = $v === 'migrate'; // the safety copy of a migration (0.35.1)
+        } else {
+            $ok = false;
+        }
+        if (! $ok) {
+            return $bad(strpos($k, 'mp') === 0
+                ? 'bind mount ' . $k . ' must come from an existing folder below ' . implode(', ', nexovirt_bind_roots()) . ' (no system or storage folder)'
+                : 'not allowed: ' . $k);
+        }
+        $cmd .= ' --' . $k . ' ' . escapeshellarg($v);
+    }
+    $dels = [];
+    foreach ($del as $d) {
+        $d  = (string) $d;
+        $ok = $type === 'lxc'
+            ? ($d === 'features' || preg_match('/^mp([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/', $d) === 1)
+            : ($d === 'args' || $d === 'lock' || preg_match('/^hostpci([0-9]|1[0-5])$/', $d) === 1);
+        if (! $ok || isset($set[$d])) {
+            return $bad('not allowed: delete ' . $d);
+        }
+        $dels[] = $d;
+    }
+    if ($dels !== []) {
+        $cmd .= ' --delete ' . escapeshellarg(implode(',', $dels));
+    }
+    if ($type === 'qemu' && (isset($set['lock']) || in_array('lock', $dels, true))) {
+        $cmd .= ' --skiplock 1'; // changing the lock of a locked VM
+    }
+    return ['ok' => true, 'error' => '', 'cmd' => $cmd . ' 2>&1'];
+}
+
+/** The guest's current QEMU args (empty when none or unreadable). */
+function nexovirt_qemu_current_args(string $node, string $vmid): string
+{
+    $out = [];
+    $code = 0;
+    exec('pvesh get ' . escapeshellarg('/nodes/' . $node . '/qemu/' . $vmid . '/config') . ' --output-format json 2>/dev/null', $out, $code);
+    $cfg = $code === 0 ? json_decode(implode("\n", $out), true) : null;
+    return is_array($cfg) ? (string) ($cfg['args'] ?? '') : '';
+}
+
+/** @return array{ok:bool,result:string} */
+/** True when the container is unprivileged (pvesh config read). */
+function nexovirt_lxc_unprivileged(string $node, string $vmid): bool
+{
+    $out = [];
+    $code = 0;
+    exec('pvesh get ' . escapeshellarg('/nodes/' . $node . '/lxc/' . $vmid . '/config') . ' --output-format json 2>/dev/null', $out, $code);
+    $cfg = $code === 0 ? json_decode(implode("\n", $out), true) : null;
+    return is_array($cfg) && (string) ($cfg['unprivileged'] ?? '0') === '1';
+}
+
+function nexovirt_pve_root_config(array $p, ?callable $run = null): array
+{
+    $self = explode('.', strtolower(trim((string) @gethostname())))[0];
+    $b = nexovirt_pve_root_config_cmd($p, $self, 'nexovirt_qemu_current_args', null, null, 'nexovirt_lxc_unprivileged');
+    if (! $b['ok']) {
+        return ['ok' => false, 'result' => 'invalid pve_root_config payload: ' . $b['error']];
+    }
+    $run = $run ?? static function (string $cmd): array {
+        $out = [];
+        $code = 0;
+        exec($cmd, $out, $code);
+        return ['code' => $code, 'out' => implode("\n", $out)];
+    };
+    $r = $run($b['cmd']);
+    return ['ok' => $r['code'] === 0, 'result' => $r['code'] === 0 ? 'applied' : substr((string) $r['out'], -1500)];
+}
+
+/*
+ * 0.35.1, for sign-ins other than root@pam (API tokens): two more things Proxmox reserves for root.
+ * pve_backup_script: the per-disk vzdump hook on a datacenter backup job (the job option `script`), only the hook
+ * NexoVirt itself installs for that job. pve_root_restore: restoring a container backup that holds bind mounts or raw
+ * lxc.* lines (a non-root restore refuses binds and silently drops lxc.* lines); runs `pct restore` detached and returns
+ * the Proxmox task id.
+ */
+/** @return array{ok:bool,error:string,cmd:string} */
+function nexovirt_pve_backup_script_cmd(array $p): array
+{
+    $id     = (string) ($p['id'] ?? '');
+    $script = (string) ($p['script'] ?? '');
+    if (preg_match('/^[A-Za-z][A-Za-z0-9_-]{2,63}$/', $id) !== 1) {
+        return ['ok' => false, 'error' => 'bad job id', 'cmd' => ''];
+    }
+    if ($script !== '' && $script !== NEXOVIRT_BACKUP_HOOK_DIR . '/' . $id . '.sh') {
+        return ['ok' => false, 'error' => 'only the NexoVirt hook of this job may be set', 'cmd' => ''];
+    }
+    $cmd = 'pvesh set ' . escapeshellarg('/cluster/backup/' . $id)
+        . ($script !== '' ? ' --script ' . escapeshellarg($script) : ' --delete script');
+    return ['ok' => true, 'error' => '', 'cmd' => $cmd . ' 2>&1'];
+}
+
+function nexovirt_pve_backup_script(array $p, ?callable $run = null): array
+{
+    $b = nexovirt_pve_backup_script_cmd($p);
+    if (! $b['ok']) {
+        return ['ok' => false, 'result' => 'invalid pve_backup_script payload: ' . $b['error']];
+    }
+    $run = $run ?? static function (string $cmd): array {
+        $out = [];
+        $code = 0;
+        exec($cmd, $out, $code);
+        return ['code' => $code, 'out' => implode("\n", $out)];
+    };
+    $r = $run($b['cmd']);
+    return ['ok' => $r['code'] === 0, 'result' => $r['code'] === 0 ? 'applied' : substr((string) $r['out'], -1500)];
+}
+
+/** @return array{ok:bool,error:string,cmd:string} the detached `pct restore` for this node */
+function nexovirt_pve_root_restore_cmd(array $p, string $selfNode): array
+{
+    $bad     = static fn (string $why): array => ['ok' => false, 'error' => $why, 'cmd' => ''];
+    $node    = (string) ($p['node'] ?? '');
+    $vmid    = is_int($p['vmid'] ?? null) ? (string) $p['vmid'] : (string) ($p['vmid'] ?? '');
+    $archive = (string) ($p['archive'] ?? '');
+    $storage = (string) ($p['storage'] ?? '');
+    if (strtolower($node) !== strtolower($selfNode) || preg_match('/^[1-9][0-9]{2,8}$/', $vmid) !== 1) {
+        return $bad('bad guest');
+    }
+    // a backup volume only: <storage>:backup/<file> (dir) or <storage>:backup/ct/<id>/<time> (PBS)
+    if (preg_match('#^[A-Za-z0-9_.-]+:backup/[A-Za-z0-9_.:+/-]{1,200}$#', $archive) !== 1 || str_contains($archive, '..')) {
+        return $bad('bad archive');
+    }
+    if (preg_match('/^[A-Za-z0-9_.-]{1,64}$/', $storage) !== 1) {
+        return $bad('bad storage');
+    }
+    $cmd = 'systemd-run --unit=' . escapeshellarg('nexovirt-restore-' . $vmid) . ' --collect --quiet pct restore '
+        . escapeshellarg($vmid) . ' ' . escapeshellarg($archive) . ' --storage ' . escapeshellarg($storage);
+    foreach (['force', 'unique', 'unprivileged'] as $flag) {
+        if (array_key_exists($flag, $p)) {
+            $cmd .= ' --' . $flag . ' ' . (! empty($p[$flag]) ? '1' : '0');
+        }
+    }
+    return ['ok' => true, 'error' => '', 'cmd' => $cmd . ' 2>&1'];
+}
+
+/** Start the restore detached and wait (max 30 s) for its Proxmox task: result = the UPID. */
+function nexovirt_pve_root_restore(array $p, ?callable $run = null, ?callable $tasks = null, ?callable $sleep = null): array
+{
+    $self = explode('.', strtolower(trim((string) @gethostname())))[0];
+    $b = nexovirt_pve_root_restore_cmd($p, $self);
+    if (! $b['ok']) {
+        return ['ok' => false, 'result' => 'invalid pve_root_restore payload: ' . $b['error']];
+    }
+    $vmid  = (string) $p['vmid'];
+    $run   = $run ?? static function (string $cmd): array {
+        $out = [];
+        $code = 0;
+        exec($cmd, $out, $code);
+        return ['code' => $code, 'out' => implode("\n", $out)];
+    };
+    $tasks = $tasks ?? static function (string $node, string $vmid): array {
+        $out = [];
+        exec('pvesh get ' . escapeshellarg('/nodes/' . $node . '/tasks') . ' --vmid ' . escapeshellarg($vmid)
+            . ' --typefilter vzrestore --limit 5 --output-format json 2>/dev/null', $out);
+        $d = json_decode(implode("\n", $out), true);
+        return is_array($d) ? $d : [];
+    };
+    $sleep = $sleep ?? static fn () => sleep(1);
+    $since = time() - 2;
+    $r = $run($b['cmd']);
+    if ($r['code'] !== 0) {
+        return ['ok' => false, 'result' => substr((string) $r['out'], -1500)];
+    }
+    for ($i = 0; $i < 30; $i++) {
+        foreach ($tasks((string) $p['node'], $vmid) as $t) {
+            if (is_array($t) && (int) ($t['starttime'] ?? 0) >= $since && str_starts_with((string) ($t['upid'] ?? ''), 'UPID:')) {
+                return ['ok' => true, 'result' => (string) $t['upid']];
+            }
+        }
+        $sleep();
+    }
+    return ['ok' => false, 'result' => 'the restore did not start (no Proxmox task appeared)'];
+}
+
+/*
+ * pve_token_ensure: NexoVirt's own Proxmox sign-in. User nexovirt@pve (Administrator on /), token "panel" without
+ * privilege separation, re-created on every run (rotation). A same-named user that NexoVirt did not create is left alone.
+ * The result carries the secret once; the panel redacts the job row right after reading it.
+ */
+const NEXOVIRT_PVE_USER    = 'nexovirt@pve';
+const NEXOVIRT_PVE_COMMENT = 'NexoVirt panel';
+
+/** Token names are per panel and connection (nx<panel id>h<host id>), so panels never rotate each other's token. */
+function nexovirt_pve_token_name_ok(string $name): bool
+{
+    return preg_match('/^nx[a-f0-9]{8}h[1-9][0-9]{0,8}$/', $name) === 1;
+}
+
+/** @return array{ok:bool,result:string} */
+function nexovirt_pve_token_ensure(string $token, ?callable $run = null): array
+{
+    if (! nexovirt_pve_token_name_ok($token)) {
+        return ['ok' => false, 'result' => 'invalid pve_token_ensure payload'];
+    }
+    $run = $run ?? static function (string $cmd): array {
+        $out = [];
+        $code = 0;
+        exec($cmd, $out, $code);
+        return ['code' => $code, 'out' => implode("\n", $out)];
+    };
+    $u = escapeshellarg(NEXOVIRT_PVE_USER);
+    $list = $run('pveum user list --output-format json 2>/dev/null');
+    $users = $list['code'] === 0 ? json_decode($list['out'], true) : null;
+    if (! is_array($users)) {
+        return ['ok' => false, 'result' => 'could not read the Proxmox users'];
+    }
+    $found = null;
+    foreach ($users as $row) {
+        if (is_array($row) && ($row['userid'] ?? '') === NEXOVIRT_PVE_USER) {
+            $found = $row;
+        }
+    }
+    if ($found !== null && strpos((string) ($found['comment'] ?? ''), NEXOVIRT_PVE_COMMENT) !== 0) {
+        return ['ok' => false, 'result' => 'user ' . NEXOVIRT_PVE_USER . ' exists and was not created by NexoVirt'];
+    }
+    // A user the node's admin disabled or let expire stays that way: NexoVirt never re-enables or re-grants it.
+    if ($found !== null && ((string) ($found['enable'] ?? '1') === '0' || ((int) ($found['expire'] ?? 0) > 0 && (int) $found['expire'] < time()))) {
+        return ['ok' => false, 'result' => 'user ' . NEXOVIRT_PVE_USER . ' is disabled on Proxmox'];
+    }
+    $steps = [];
+    if ($found === null) {
+        $steps[] = 'pveum user add ' . $u . ' --comment ' . escapeshellarg(NEXOVIRT_PVE_COMMENT) . ' 2>&1';
+        $steps[] = 'pveum acl modify / --users ' . $u . ' --roles Administrator 2>&1';
+    }
+    foreach ($steps as $cmd) {
+        $r = $run($cmd);
+        if ($r['code'] !== 0) {
+            return ['ok' => false, 'result' => substr((string) $r['out'], -500)];
+        }
+    }
+    $run('pveum user token remove ' . $u . ' ' . escapeshellarg($token) . ' 2>&1'); // absent on first run
+    $add = $run('pveum user token add ' . $u . ' ' . escapeshellarg($token) . ' --privsep 0 --comment '
+        . escapeshellarg(NEXOVIRT_PVE_COMMENT) . ' --output-format json 2>/dev/null');
+    $tok = $add['code'] === 0 ? json_decode($add['out'], true) : null;
+    if (! is_array($tok) || ! is_string($tok['value'] ?? null) || preg_match('/^[0-9a-f-]{36}$/', $tok['value']) !== 1) {
+        return ['ok' => false, 'result' => 'Proxmox did not return the new token'];
+    }
+    return ['ok' => true, 'result' => json_encode(['tokenid' => NEXOVIRT_PVE_USER . '!' . $token, 'secret' => $tok['value']])];
 }
 
 /**
@@ -6900,13 +7492,13 @@ const APP_CT_DIR     = '/root/.nexovirt-app';
 
 /**
  * The FIXED script that runs inside the container (no payload value is formatted into it): wait for
- * DNS, load and delete the env file, then run the pushed install script with its output appended to
+ * DNS (each lookup at most 3 s, about 2.5 minutes in all, so a container without internet still runs the script), load and delete the env file, then run the pushed install script with its output appended to
  * /var/log/nexovirt-app.log inside the CT. Exit status = the install script's (pipefail).
  */
 const APP_INNER = <<<'SH'
 set -o pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive
-for i in $(seq 1 60); do getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done
+for i in $(seq 1 30); do timeout 3 getent hosts deb.debian.org >/dev/null 2>&1 && break; sleep 2; done
 set -a
 . /root/.nexovirt-app/env
 set +a
@@ -8746,6 +9338,26 @@ function nexovirt_dispatch_job(array $job, array $config = []): array
         return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
     }
 
+    if ($type === 'pve_root_config') {
+        $r = nexovirt_pve_root_config($p);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
+    if ($type === 'pve_backup_script') {
+        $r = nexovirt_pve_backup_script($p);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
+    if ($type === 'pve_root_restore') {
+        $r = nexovirt_pve_root_restore($p);
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
+    if ($type === 'pve_token_ensure') {
+        $r = nexovirt_pve_token_ensure((string) ($p['token'] ?? ''));
+        return ['id' => $id, 'ok' => $r['ok'], 'result' => $r['result']];
+    }
+
     if ($type === 'dyndns_configure') {
         $valid = nexovirt_validate_dyndns_payload($p);
         if (! $valid['ok']) {
@@ -9152,7 +9764,9 @@ if (getenv('NEXOVIRT_AGENT_NO_MAIN') !== '1') {
                 $out   = nexovirt_run_job($job, $config);
                 $jobTs = date('Y-m-d H:i:s');
                 // Log only a prefix: results can be large JSON blobs.
-                fwrite(STDOUT, "[{$jobTs}] Job {$out['id']} " . ($out['ok'] ? 'OK' : 'ERROR') . ': ' . substr((string) $out['result'], 0, 200) . "\n");
+                // Never log a token secret (pve_token_ensure carries one in its result).
+                $shown = ($job['type'] ?? '') === 'pve_token_ensure' && $out['ok'] ? 'token created' : substr((string) $out['result'], 0, 200);
+                fwrite(STDOUT, "[{$jobTs}] Job {$out['id']} " . ($out['ok'] ? 'OK' : 'ERROR') . ': ' . $shown . "\n");
                 if (($job['type'] ?? '') === 'dyndns_configure') {
                     $dyndnsLast = 0; // publish right after the result is delivered
                 }
